@@ -40,6 +40,7 @@ jobs:
       - name: Create least-privilege roles and run migrations against PostgreSQL 16
         env:
           UTDA_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
+          UTDA_DATABASE_SSLMODE: 'disable'
           UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
           UTDA_DRY_RUN: 'true'
         run: |
@@ -70,6 +71,7 @@ jobs:
       - name: Run full Phase 0 and Phase 1 test suite against PostgreSQL 16
         env:
           UTDA_TEST_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
+          UTDA_DATABASE_SSLMODE: 'disable'
           UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
           UTDA_DRY_RUN: 'true'
         run: python -m pytest -v -rs
@@ -81,7 +83,7 @@ jobs:
           pg_dump --format=custom --schema=utda --no-owner --no-privileges "$ADMIN_DSN" -f utda_ci_backup.dump
           psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE utda_restore_verify;"
           pg_restore --dbname="$RESTORE_DSN" --no-owner --no-privileges utda_ci_backup.dump
-          UTDA_DATABASE_URL="$RESTORE_DSN" UTDA_ALLOW_INSECURE_LOCAL_DB=true python -m engine.db_health --json
+          UTDA_DATABASE_URL="$RESTORE_DSN" UTDA_DATABASE_SSLMODE=disable UTDA_ALLOW_INSECURE_LOCAL_DB=true python -m engine.db_health --json
           rm -f utda_ci_backup.dump
       - name: Verify read-only Supabase probe defaults cleanly to pending when unset
         run: python -m engine.db_health --readonly-verify --json
