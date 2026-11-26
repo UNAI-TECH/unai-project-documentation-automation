@@ -2,7 +2,8 @@ name: UTDA Database Integration CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'setup/**']
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -31,13 +32,56 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install dependencies
+      - name: Install PostgreSQL client and Python dependencies
         run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
-      - name: Run Phase 0 and Phase 1 database tests against local PostgreSQL
+      - name: Create least-privilege roles and run migrations against PostgreSQL 16
+        env:
+          UTDA_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
+          UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
+          UTDA_DRY_RUN: 'true'
+        run: |
+          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE utda_migrator NOINHERIT LOGIN PASSWORD 'mig_pw_test';"
+          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE utda_runtime NOINHERIT LOGIN PASSWORD 'run_pw_test';"
+          python -m engine.migrations.runner --plan
+          python -m engine.migrations.runner --apply
+          python -m engine.db_health --json
+      - name: Verify least-privilege role enforcement on PostgreSQL 16
+        env:
+          RUNTIME_DSN: postgresql://utda_runtime:run_pw_test@localhost:5432/utda_test_db
+        run: |
+          psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM utda.schema_migrations;"
+          psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "INSERT INTO utda.audit_events (event_id, actor, event_type) VALUES ('ci-priv-test', 'ci', 'PRIV_CHECK');"
+          if psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "DELETE FROM utda.audit_events;" 2>/dev/null; then
+            echo "ERROR: utda_runtime must not be allowed to DELETE from utda.audit_events"
+            exit 1
+          fi
+          if psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "UPDATE utda.audit_events SET actor='tamper';" 2>/dev/null; then
+            echo "ERROR: utda_runtime must not be allowed to UPDATE utda.audit_events"
+            exit 1
+          fi
+          if psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "CREATE TABLE utda.illegal_table (id int);" 2>/dev/null; then
+            echo "ERROR: utda_runtime must not be allowed to CREATE tables in utda"
+            exit 1
+          fi
+          echo "Least-privilege role verification passed."
+      - name: Run full Phase 0 and Phase 1 test suite against PostgreSQL 16
         env:
           UTDA_TEST_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
           UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
           UTDA_DRY_RUN: 'true'
-        run: python -m unittest discover -s tests -v
+        run: python -m pytest -v -rs
+      - name: Verify pg_dump backup and pg_restore recovery on PostgreSQL 16
+        env:
+          ADMIN_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
+          RESTORE_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_restore_verify
+        run: |
+          pg_dump --format=custom --schema=utda --no-owner --no-privileges "$ADMIN_DSN" -f utda_ci_backup.dump
+          psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE utda_restore_verify;"
+          pg_restore --dbname="$RESTORE_DSN" --no-owner --no-privileges utda_ci_backup.dump
+          UTDA_DATABASE_URL="$RESTORE_DSN" UTDA_ALLOW_INSECURE_LOCAL_DB=true python -m engine.db_health --json
+          rm -f utda_ci_backup.dump
+      - name: Verify read-only Supabase probe defaults cleanly to pending when unset
+        run: python -m engine.db_health --readonly-verify --json

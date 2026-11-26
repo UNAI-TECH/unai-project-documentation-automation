@@ -86,9 +86,14 @@ def assert_migration_connection_supported(config: DatabaseConfig) -> None:
 def _rewrite_schema_prefix(sql: str, schema: str) -> str:
     if schema == "utda":
         return sql
-    return sql.replace("utda.", f"{schema}.").replace("SCHEMA utda", f"SCHEMA {schema}").replace(
-        "SCHEMA IF NOT EXISTS utda", f"SCHEMA IF NOT EXISTS {schema}"
+    rewritten = re.sub(r"\butda\.", f"{schema}.", sql)
+    rewritten = re.sub(
+        r"\bSCHEMA\s+(IF\s+NOT\s+EXISTS\s+)?utda\b",
+        lambda m: f"SCHEMA {m.group(1) or ''}{schema}",
+        rewritten,
+        flags=re.IGNORECASE,
     )
+    return rewritten
 
 
 def _fetch_applied_migrations(conn: Any, schema: str) -> dict[str, tuple[str, str]]:
@@ -161,7 +166,7 @@ def apply_migrations(
     applied_versions: list[str] = []
     with conn_ctx as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (f"utda_mig:{config.schema}",))
+            cur.execute("SELECT pg_advisory_lock(hashtext(%s::text)::bigint)", (f"utda_mig:{config.schema}",))
         conn.commit()
         try:
             pending = plan_migrations(conn, config.schema, migrations)
@@ -207,7 +212,7 @@ def apply_migrations(
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+                        "SELECT pg_advisory_unlock(hashtext(%s::text)::bigint)",
                         (f"utda_mig:{config.schema}",),
                     )
                 conn.commit()

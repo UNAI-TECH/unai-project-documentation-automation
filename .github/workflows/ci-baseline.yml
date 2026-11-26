@@ -2,12 +2,14 @@ name: UTDA Phase 0 Baseline Validation
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'setup/**']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   validate-contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

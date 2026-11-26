@@ -22,8 +22,10 @@ Create `utda_migrator` and `utda_runtime` in Supabase SQL Editor with strong uni
 ```sql
 CREATE ROLE utda_migrator NOINHERIT LOGIN PASSWORD '<STRONG_MIGRATOR_PASSWORD>';
 CREATE ROLE utda_runtime NOINHERIT LOGIN PASSWORD '<STRONG_RUNTIME_PASSWORD>';
+REVOKE CREATE ON SCHEMA public FROM utda_runtime;
 ```
-*(In Supabase Dashboard -> API Settings, keep `utda` excluded from exposed PostgREST schemas so the Data API never exposes internal automation tables.)*
+- `0002_roles_and_indexes.sql` grants `utda_runtime` `SELECT, INSERT, UPDATE` on operational `utda.*` tables, revokes `DELETE` on all `utda.*` tables, and revokes `UPDATE` on immutable audit/provenance tables (`audit_events`, `approval_records`, `rollback_operations`, `github_event_receipts`, `final_reports`, `schema_migrations`).
+- *(In Supabase Dashboard -> API Settings, keep `utda` excluded from exposed PostgREST schemas so the Data API never exposes internal automation tables.)*
 
 ---
 

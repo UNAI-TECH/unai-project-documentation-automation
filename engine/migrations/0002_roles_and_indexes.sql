@@ -30,10 +30,20 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_type_occurred
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'utda_runtime') THEN
-        REVOKE ALL ON SCHEMA public FROM utda_runtime;
         GRANT USAGE ON SCHEMA utda TO utda_runtime;
         GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA utda TO utda_runtime;
-        REVOKE INSERT, UPDATE, DELETE ON utda.schema_migrations FROM utda_runtime;
+        REVOKE DELETE ON ALL TABLES IN SCHEMA utda FROM utda_runtime;
+
+        -- Immutable / append-only audit and governance tables cannot be updated by runtime.
+        REVOKE UPDATE, DELETE ON
+            utda.audit_events,
+            utda.approval_records,
+            utda.rollback_operations,
+            utda.github_event_receipts,
+            utda.final_reports,
+            utda.schema_migrations
+        FROM utda_runtime;
+        REVOKE INSERT ON utda.schema_migrations FROM utda_runtime;
         GRANT SELECT ON utda.schema_migrations TO utda_runtime;
     END IF;
 

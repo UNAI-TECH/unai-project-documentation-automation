@@ -153,11 +153,33 @@ class _FakeCursor:
         if "INSERT INTO" in norm and ".idempotency_keys" in norm:
             idem_key = params[0]
             with state.lock:
-                if idem_key in state.idempotency_keys:
-                    self._rows = []
-                else:
+                existing = state.idempotency_keys.get(idem_key)
+                if existing is None or existing.get("status") == "FAILED":
                     state.idempotency_keys[idem_key] = {"status": "IN_PROGRESS"}
                     self._rows = [(idem_key,)]
+                else:
+                    self._rows = []
+            return
+        if "SELECT COALESCE(MAX(attempt_number), 0) + 1" in norm and ".processing_attempts" in norm:
+            idem_key = params[0]
+            with state.lock:
+                cnt = sum(1 for a in state.attempts if a[2] == idem_key)
+                self._rows = [(cnt + 1,)]
+            return
+        if "SELECT state_id, status, pr_number, pr_merged_sha, report_blob_sha" in norm:
+            project_id, feature_id = params[0], params[1]
+            with state.lock:
+                rec = state.feature_states.get((project_id, feature_id))
+                if rec:
+                    self._rows = [
+                        (
+                            rec["state_id"],
+                            rec["status"],
+                            None,
+                            rec.get("pr_merged_sha"),
+                            rec.get("report_blob_sha"),
+                        )
+                    ]
             return
         if "UPDATE" in norm and ".idempotency_keys" in norm:
             status, _summary, idem_key = params
@@ -532,12 +554,48 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
         "Local PostgreSQL UTDA_TEST_DATABASE_URL not set (runs in ci-database.yml)",
     )
     def test_real_local_postgres_migrations_and_persistence(self) -> None:
+        import psycopg
+
         cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_DATABASE_URL")
         apply_result = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False)
         self.assertIn(apply_result["mode"], ("apply",))
 
+        # Verify advisory lock contention across two real PG16 connections
+        with psycopg.connect(cfg.dsn, **cfg.connect_kwargs(for_migration=True)) as c1:
+            with psycopg.connect(cfg.dsn, **cfg.connect_kwargs(for_migration=True)) as c2:
+                with c1.cursor() as cur1, c2.cursor() as cur2:
+                    cur1.execute("SELECT pg_advisory_lock(hashtext('utda_test_lock')::bigint)")
+                    c1.commit()
+                    cur2.execute("SELECT pg_try_advisory_lock(hashtext('utda_test_lock')::bigint)")
+                    self.assertFalse(cur2.fetchone()[0])
+                    cur1.execute("SELECT pg_advisory_unlock(hashtext('utda_test_lock')::bigint)")
+                    c1.commit()
+                    cur2.execute("SELECT pg_try_advisory_lock(hashtext('utda_test_lock')::bigint)")
+                    self.assertTrue(cur2.fetchone()[0])
+                    cur2.execute("SELECT pg_advisory_unlock(hashtext('utda_test_lock')::bigint)")
+                    c2.commit()
+
+        # Verify migration atomicity on real PG16 (failed DDL rolls back completely)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            for m in discover_migrations(MIGRATIONS_DIR):
+                (tmp_dir / m.path.name).write_text(m.sql, encoding="utf-8")
+            (tmp_dir / "0003_broken.sql").write_text(
+                "CREATE TABLE utda.should_not_exist (id INT); THIS IS INVALID SQL;",
+                encoding="utf-8",
+            )
+            with self.assertRaises(MigrationError):
+                apply_migrations(cfg, tmp_dir, dry_run=False)
+
+        with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as chk:
+            with chk.cursor() as cur:
+                cur.execute(
+                    "SELECT to_regclass('utda.should_not_exist')"
+                )
+                self.assertIsNone(cur.fetchone()[0])
+
         with DatabaseManager(cfg) as db:
-            health = check_database_health(db)
+            health = check_database_health(db, read_only=True)
             self.assertIn(health["status"], ("healthy", "warning"))
             repo = UTDADatabaseRepository(db)
             repo.upsert_project(
@@ -556,17 +614,46 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 report_blob_sha="sha1",
                 target_document_id="D06",
             )
-            self.assertIsInstance(claimed, bool)
+            self.assertTrue(claimed)
+            # Duplicate claim blocked
+            self.assertFalse(
+                repo.acquire_idempotency_key(
+                    idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
+                    scope="ci_test",
+                    project_id="CI_LOCAL_TEST",
+                    feature_id="FEAT-CI",
+                    report_blob_sha="sha1",
+                    target_document_id="D06",
+                )
+            )
+            # Mark FAILED and verify recovery re-claims lock
+            repo.complete_idempotency_key(
+                idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
+                status="FAILED",
+                result_summary={"error": "transient"},
+            )
+            self.assertTrue(
+                repo.acquire_idempotency_key(
+                    idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
+                    scope="ci_test",
+                    project_id="CI_LOCAL_TEST",
+                    feature_id="FEAT-CI",
+                    report_blob_sha="sha1",
+                    target_document_id="D06",
+                )
+            )
 
     @unittest.skipUnless(
         os.getenv("UTDA_RUN_LIVE_SUPABASE_TESTS") == "true" and os.getenv("UTDA_DATABASE_URL"),
         "PENDING: Live Supabase verification requires UTDA_DATABASE_URL and UTDA_RUN_LIVE_SUPABASE_TESTS=true",
     )
     def test_live_supabase_readonly_health_check(self) -> None:
-        cfg = DatabaseConfig.from_env(dsn_var="UTDA_DATABASE_URL")
-        with DatabaseManager(cfg) as db:
-            health = check_database_health(db)
-            self.assertIn(health["status"], ("healthy", "warning"))
+        from engine.db_health import verify_live_supabase_readonly
+
+        report = verify_live_supabase_readonly()
+        self.assertTrue(report["verified"])
+        self.assertTrue(report["read_only"])
+        self.assertIn(report["status"], ("healthy", "warning", "critical"))
 
 
 if __name__ == "__main__":

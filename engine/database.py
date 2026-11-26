@@ -310,7 +310,7 @@ class UTDADatabaseRepository:
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
-                CASE WHEN %s IS NOT NULL AND %s IS NOT NULL THEN TIMEZONE('utc', NOW()) ELSE NULL END,
+                CASE WHEN %s::text IS NOT NULL AND %s::text IS NOT NULL THEN TIMEZONE('utc', NOW()) ELSE NULL END,
                 TIMEZONE('utc', NOW())
             )
             ON CONFLICT (project_id, feature_id) DO UPDATE SET
@@ -318,7 +318,7 @@ class UTDADatabaseRepository:
                 pr_merged_sha = COALESCE(EXCLUDED.pr_merged_sha, {self._tbl('feature_processing_states')}.pr_merged_sha),
                 report_blob_sha = COALESCE(EXCLUDED.report_blob_sha, {self._tbl('feature_processing_states')}.report_blob_sha),
                 status = CASE
-                    WHEN %s IS NOT NULL THEN %s
+                    WHEN %s::text IS NOT NULL THEN %s::text
                     WHEN COALESCE(EXCLUDED.pr_merged_sha, {self._tbl('feature_processing_states')}.pr_merged_sha) IS NOT NULL
                      AND COALESCE(EXCLUDED.report_blob_sha, {self._tbl('feature_processing_states')}.report_blob_sha) IS NOT NULL
                     THEN 'READY'
@@ -378,15 +378,30 @@ class UTDADatabaseRepository:
         feature_id: str,
         report_blob_sha: str,
         target_document_id: str,
+        lock_ttl_seconds: int = 900,
     ) -> bool:
-        """Atomically claim an idempotency key; returns False if already claimed."""
+        """Atomically claim an idempotency key or recover a FAILED/expired lock."""
+        tbl = self._tbl("idempotency_keys")
         sql = f"""
-            INSERT INTO {self._tbl('idempotency_keys')} (
+            INSERT INTO {tbl} (
                 idempotency_key, scope, project_id, feature_id,
-                report_blob_sha, target_document_id, status, locked_at
+                report_blob_sha, target_document_id, status, locked_at, expires_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, 'IN_PROGRESS', TIMEZONE('utc', NOW()))
-            ON CONFLICT (idempotency_key) DO NOTHING
+            VALUES (
+                %s, %s, %s, %s, %s, %s, 'IN_PROGRESS',
+                TIMEZONE('utc', NOW()),
+                TIMEZONE('utc', NOW()) + (%s::integer * INTERVAL '1 second')
+            )
+            ON CONFLICT (idempotency_key) DO UPDATE SET
+                status = 'IN_PROGRESS',
+                locked_at = TIMEZONE('utc', NOW()),
+                expires_at = TIMEZONE('utc', NOW()) + (%s::integer * INTERVAL '1 second')
+            WHERE {tbl}.status = 'FAILED'
+               OR (
+                   {tbl}.status = 'IN_PROGRESS'
+                   AND {tbl}.expires_at IS NOT NULL
+                   AND {tbl}.expires_at < TIMEZONE('utc', NOW())
+               )
             RETURNING idempotency_key
         """
 
@@ -401,9 +416,53 @@ class UTDADatabaseRepository:
                         feature_id,
                         report_blob_sha,
                         target_document_id,
+                        lock_ttl_seconds,
+                        lock_ttl_seconds,
                     ),
                 )
                 return cur.fetchone() is not None
+
+        return self.db.run_in_transaction(_op)
+
+    def get_feature_state(
+        self, *, project_id: str, feature_id: str
+    ) -> dict[str, Any] | None:
+        """Return current correlation state for (project_id, feature_id)."""
+        sql = f"""
+            SELECT state_id, status, pr_number, pr_merged_sha, report_blob_sha
+            FROM {self._tbl('feature_processing_states')}
+            WHERE project_id = %s AND feature_id = %s
+        """
+
+        def _op(conn: Any) -> dict[str, Any] | None:
+            with conn.cursor() as cur:
+                cur.execute(sql, (project_id, feature_id))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return {
+                    "state_id": row[0],
+                    "status": row[1],
+                    "pr_number": row[2],
+                    "pr_merged_sha": row[3],
+                    "report_blob_sha": row[4],
+                }
+
+        return self.db.run_in_transaction(_op)
+
+    def next_attempt_number(self, *, idempotency_key: str) -> int:
+        """Return the next sequential attempt number for an idempotency key."""
+        sql = f"""
+            SELECT COALESCE(MAX(attempt_number), 0) + 1
+            FROM {self._tbl('processing_attempts')}
+            WHERE idempotency_key = %s
+        """
+
+        def _op(conn: Any) -> int:
+            with conn.cursor() as cur:
+                cur.execute(sql, (idempotency_key,))
+                row = cur.fetchone()
+                return int(row[0]) if row else 1
 
         return self.db.run_in_transaction(_op)
 

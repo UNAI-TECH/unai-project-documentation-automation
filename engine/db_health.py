@@ -1,8 +1,9 @@
-"""Database health, connectivity, and Supabase Free Plan quota checks."""
+"""Database health, connectivity, read-only Supabase probe, and Free Plan quota checks."""
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from typing import Any
@@ -15,13 +16,17 @@ WARN_PCT = 70.0
 CRITICAL_PCT = 85.0
 
 
-def check_database_health(db: DatabaseManager) -> dict[str, Any]:
+def check_database_health(
+    db: DatabaseManager, *, read_only: bool = False
+) -> dict[str, Any]:
     """Run connectivity, migration-status, and Free-Plan quota checks safely."""
     start = time.monotonic()
     schema = db.config.schema
 
     def _probe(conn: Any) -> dict[str, Any]:
         with conn.cursor() as cur:
+            if read_only:
+                cur.execute("SET TRANSACTION READ ONLY")
             cur.execute("SELECT 1")
             cur.fetchone()
 
@@ -63,6 +68,7 @@ def check_database_health(db: DatabaseManager) -> dict[str, Any]:
     except DatabaseUnavailableError as exc:
         return {
             "status": "unhealthy",
+            "read_only": read_only,
             "error": sanitize_log_text(str(exc)),
             "database": db.config.redacted_summary(),
         }
@@ -79,6 +85,7 @@ def check_database_health(db: DatabaseManager) -> dict[str, Any]:
 
     return {
         "status": status,
+        "read_only": read_only,
         "latency_ms": latency_ms,
         "database": db.config.redacted_summary(),
         "storage": {
@@ -95,10 +102,41 @@ def check_database_health(db: DatabaseManager) -> dict[str, Any]:
     }
 
 
+def verify_live_supabase_readonly(dsn_var: str = "UTDA_DATABASE_URL") -> dict[str, Any]:
+    """Perform a non-mutating read-only Supabase verification without running migrations."""
+    raw = os.environ.get(dsn_var, "").strip()
+    if not raw:
+        return {
+            "status": "pending",
+            "verified": False,
+            "reason": f"{dsn_var} is not configured in environment.",
+        }
+    config = DatabaseConfig.from_env(dsn_var=dsn_var)
+    with DatabaseManager(config) as db:
+        report = check_database_health(db, read_only=True)
+    report["verified"] = report["status"] in ("healthy", "warning", "critical")
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="UTDA database health check")
     parser.add_argument("--json", action="store_true", help="Output JSON report")
+    parser.add_argument(
+        "--readonly-verify",
+        action="store_true",
+        help="Verify live connection in READ ONLY mode (returns pending if unset)",
+    )
     args = parser.parse_args(argv)
+
+    if args.readonly_verify:
+        try:
+            report = verify_live_supabase_readonly()
+        except DatabaseConfigError as exc:
+            payload = {"status": "misconfigured", "verified": False, "error": str(exc)}
+            print(json.dumps(payload, indent=2) if args.json else payload, file=sys.stderr)
+            return 2
+        print(json.dumps(report, indent=2) if args.json else report)
+        return 0 if report["status"] in ("healthy", "warning", "pending") else 1
 
     try:
         config = DatabaseConfig.from_env()
