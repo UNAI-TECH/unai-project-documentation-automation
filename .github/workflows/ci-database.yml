@@ -32,9 +32,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install PostgreSQL client and Python dependencies
+      - name: Install PostgreSQL 16 client and Python dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
       - name: Create least-privilege roles and run migrations against PostgreSQL 16
@@ -80,9 +81,10 @@ jobs:
           ADMIN_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
           RESTORE_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_restore_verify
         run: |
+          pg_dump --version
           pg_dump --format=custom --schema=utda --no-owner --no-privileges "$ADMIN_DSN" -f utda_ci_backup.dump
           psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE utda_restore_verify;"
-          pg_restore --dbname="$RESTORE_DSN" --no-owner --no-privileges utda_ci_backup.dump
+          pg_restore --exit-on-error --dbname="$RESTORE_DSN" --no-owner --no-privileges utda_ci_backup.dump
           UTDA_DATABASE_URL="$RESTORE_DSN" UTDA_DATABASE_SSLMODE=disable UTDA_ALLOW_INSECURE_LOCAL_DB=true python -m engine.db_health --json
           rm -f utda_ci_backup.dump
       - name: Verify read-only Supabase probe defaults cleanly to pending when unset
