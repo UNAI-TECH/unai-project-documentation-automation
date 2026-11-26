@@ -32,10 +32,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install PostgreSQL 16 client and Python dependencies
+      - name: Install PostgreSQL client and Python dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client-16
-          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
       - name: Create least-privilege roles and run migrations against PostgreSQL 16
