@@ -1,37 +1,41 @@
-# Phase 1 Test Report — Supabase PostgreSQL Integration
+# Phase 1 Test Report — Core Engine & PostgreSQL 16 Verification
 
-**Test Environment:** Python 3.14.4 (`psycopg 3.3.9`, `psycopg_pool 3.3.3`, `pytest 8.4.2`)  
-**Scope:** Automated unit, schema, workflow, migration, concurrency, and log-sanitization tests.  
-**Live Hosted Supabase Status:** **PENDING** (credentials not configured in this workspace; no hosted migrations executed).
+**Local Test Environment:** Python 3.14.4 (`psycopg 3.3.9`, `psycopg_pool 3.3.3`, `pytest 8.4.2`)  
+**CI Environment:** GitHub Actions `ubuntu-latest` with `postgres:16-alpine` service container  
+**Live Hosted Supabase (`unai-utda`):** **PENDING** (credentials not configured; no hosted migrations executed).
 
 ---
 
-## 1. Executed Test Commands & Observed Results
+## 1. GitHub Actions PostgreSQL 16 CI Workflow Results
 
-### `pytest -v -rs` (`.venv\Scripts\python.exe -m pytest -v -rs`)
-- **Result:** `16 passed, 2 skipped in 0.92s`
-- **unittest check:** `Ran 18 tests in 0.237s — OK (skipped=2)`
+- **UTDA Phase 0 Baseline Validation:** Run [`45820044293`](https://github.com/UNAI-TECH/unai-project-documentation-automation/actions/runs/45820044293) (commit `4b71ef3`) — **`completed: success`**
+- **UTDA Database Integration CI:** Run [`45820044223`](https://github.com/UNAI-TECH/unai-project-documentation-automation/actions/runs/45820044223) (commit `4b71ef3`) — **`completed: success`**
 
-### Breakdown by Test Case
-
-| Test Suite / Case | Outcome | What Was Verified |
+| CI Step (`45820044223`) | Result | Verified Against PostgreSQL 16 |
 | --- | --- | --- |
-| `Phase0ContractTests` (7 tests) | **7 passed** | All 8 JSON Schemas (Draft 2020-12), `document_registry.json` (`MASTER` + `COMPANY_MASTER`), `impact_matrix.json` locks, `change_type` mapping, `project_registry.json`, sample payloads, and workflow YAML contracts |
-| `Phase1DatabaseConfigTests::test_missing_database_url_fails_safely` | **passed** | Missing `UTDA_DATABASE_URL` raises `DatabaseConfigError` cleanly |
-| `Phase1DatabaseConfigTests::test_rejects_insecure_sslmode_for_remote_host` | **passed** | Rejects `sslmode=disable` for remote Supabase hosts |
-| `Phase1DatabaseConfigTests::test_rejects_supabase_http_url_and_api_keys` | **passed** | Rejects `https://...`, JWT (`eyJ...`), and `sb_secret_...` API keys |
-| `Phase1DatabaseConfigTests::test_valid_session_and_transaction_pooler_configs_and_redaction` | **passed** | Session Pooler (`5432`, migrations allowed), Transaction Pooler (`6543`, `prepare_threshold=None`, migrations blocked), and password masking |
-| `Phase1DatabaseLifecycleAndPersistenceTests::test_connection_recovery_and_failure` | **passed** | Transient `psycopg.OperationalError` retry recovery and failure exhaustion (`DatabaseUnavailableError`) |
-| `Phase1DatabaseLifecycleAndPersistenceTests::test_transaction_commit_and_rollback` | **passed** | Transaction `commit()` on success and `rollback()` on exception |
-| `Phase1DatabaseLifecycleAndPersistenceTests::test_migrations_empty_db_upgrade_checksum_and_rollback` | **passed** | Empty-DB plan/apply (`0001`, `0002`), idempotent re-run, `0003` upgrade, SHA-256 tamper error, Transaction Pooler rejection, and atomic SQL failure rollback |
-| `Phase1DatabaseLifecycleAndPersistenceTests::test_event_receipt_correlation_idempotency_concurrency_and_audit` | **passed** | Deduplicated `github_event_receipts`, PR-first -> `WAITING_FOR_FINAL_REPORT` -> report push -> `READY`, `final_reports`, 6-thread concurrent `idempotency_keys` contention (single winner), `processing_attempts`, `audit_events`, and `db_health` 500 MB quota check |
-| `Phase1DatabaseLifecycleAndPersistenceTests::test_logs_never_expose_database_credentials` | **passed** | Captures `utda.database` logs during forced errors and verifies DSN password never appears |
-| `Phase1LivePostgreSQLTests::test_real_local_postgres_migrations_and_persistence` | **skipped** | Requires `UTDA_TEST_DATABASE_URL` (local PostgreSQL not installed here; wired for `postgres:16-alpine` in [.github/workflows/ci-database.yml](file:///c:/Users/kamal/OneDrive/Desktop/utda_starter/.github/workflows/ci-database.yml)) |
-| `Phase1LivePostgreSQLTests::test_live_supabase_readonly_health_check` | **skipped (PENDING)** | Requires owner-configured `UTDA_DATABASE_URL` and `UTDA_RUN_LIVE_SUPABASE_TESTS=true` |
+| Initialize `postgres:16-alpine` & install deps | **success** | Real PG 16 service ready |
+| Create `utda_migrator`/`utda_runtime`, `--plan`, `--apply`, `db_health` | **success** | `0001` and `0002` applied cleanly |
+| Verify least-privilege role enforcement | **success** | `utda_runtime` inserted into `utda.audit_events` and was blocked from `DELETE`, `UPDATE` on `audit_events`, and `CREATE TABLE` in `utda` |
+| Run full Phase 0 and Phase 1 `pytest` suite (`UTDA_TEST_DATABASE_URL` active) | **success** | Executed real PG 16 advisory lock contention, atomic DDL rollback (`0003_broken.sql`), idempotency lock/recovery, and full PR-first correlation lifecycle |
+| Verify `pg_dump` backup and `pg_restore` recovery (`postgres:16-alpine`) | **success** | Custom-format dump of `utda` restored into `utda_restore_verify` (`--exit-on-error`) and verified with `engine.db_health --json` |
+| Verify read-only Supabase probe defaults cleanly to `pending` when unset | **success** | Returned `{"status": "pending", "verified": false}` without error |
 
 ---
 
-## 2. Verification Notes
-- Local unit tests exercise real `psycopg` v3 and `psycopg_pool` types/exceptions with an in-memory transactional state stub because neither Docker nor local PostgreSQL is installed in this Windows workspace.
-- Real PostgreSQL `postgres:16-alpine` execution is configured in [.github/workflows/ci-database.yml](file:///c:/Users/kamal/OneDrive/Desktop/utda_starter/.github/workflows/ci-database.yml).
-- Hosted Supabase (`unai-utda`) connectivity and migrations remain **pending** owner credentials and explicit approval.
+## 2. Local Automated Test Results
+
+- **Command:** `.venv\Scripts\python.exe -m pytest -v -rs`
+- **Result:** **`20 passed, 3 skipped in 5.54s`** (local skips are exclusively the 2 `UTDA_TEST_DATABASE_URL` PG16 tests that ran in CI `45820044223` and the 1 live Supabase `UTDA_DATABASE_URL` probe marked `PENDING`).
+
+### Verified Coverage Areas
+1. **Event Normalization & Pipeline (`tests/test_phase1_event_pipeline.py`):**
+   - `UTDA_DRY_RUN` fail-safe default (`true` unless explicit `'false'`) and secret scrubbing (`ghp_...`, `sk-...`, DSN passwords).
+   - Unmerged closed PR ignored (`IGNORED_UNMERGED_PR`).
+   - **PR-first correlation:** Merged PR without JSON report -> `WAITING_FOR_FINAL_REPORT` -> subsequent report push -> `DRY_RUN_READY`.
+   - **Report-first correlation:** Report push without PR merge -> `AWAIT_PR_MERGE` -> subsequent PR merge -> `DRY_RUN_READY`.
+   - **Duplicate events:** Duplicate `delivery_id` -> `SKIPPED_DUPLICATE_RECEIPT`; new `delivery_id` with identical report blob SHA -> `SKIPPED_DUPLICATE`.
+   - **Validation guardrails:** Unsubstantiated `tests[].result == "passed"` rejected (`VALIDATION_FAILED`).
+   - **Retry & recovery:** `FAILED` idempotency key atomically re-claimed on recovery with `attempt_number` incremented (`1 -> 2`).
+2. **Database Lifecycle, Migrations & Security (`tests/test_database_phase1.py`):**
+   - Missing/invalid DSNs, Supabase HTTP/JWT rejection, `sslmode` enforcement, pooler mode handling, credential-free logging, transient error recovery, transaction commit/rollback, concurrent 6-thread idempotency lock contention, migration checksum tamper detection, atomic SQL rollback, advisory lock contention, and `db_health` 500 MB Free Plan checks.
+3. **Phase 0 Contracts (`tests/test_phase0_contracts.py`):** All 7 schema, registry, matrix, and workflow contract tests passed.
