@@ -80,10 +80,10 @@ jobs:
           ADMIN_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
           RESTORE_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_restore_verify
         run: |
-          pg_dump --version
-          pg_dump --format=custom --schema=utda --no-owner --no-privileges "$ADMIN_DSN" -f utda_ci_backup.dump
+          docker run --rm --network host -v "$PWD:/work" -w /work postgres:16-alpine pg_dump --version
+          docker run --rm --network host -v "$PWD:/work" -w /work postgres:16-alpine pg_dump --format=custom --schema=utda --no-owner --no-privileges "$ADMIN_DSN" -f utda_ci_backup.dump
           psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE utda_restore_verify;"
-          pg_restore --exit-on-error --dbname="$RESTORE_DSN" --no-owner --no-privileges utda_ci_backup.dump
+          docker run --rm --network host -v "$PWD:/work" -w /work postgres:16-alpine pg_restore --exit-on-error --dbname="$RESTORE_DSN" --no-owner --no-privileges utda_ci_backup.dump
           UTDA_DATABASE_URL="$RESTORE_DSN" UTDA_DATABASE_SSLMODE=disable UTDA_ALLOW_INSECURE_LOCAL_DB=true python -m engine.db_health --json
           rm -f utda_ci_backup.dump
       - name: Verify read-only Supabase probe defaults cleanly to pending when unset
