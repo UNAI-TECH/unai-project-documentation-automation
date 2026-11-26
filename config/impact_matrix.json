@@ -99,6 +99,16 @@
         "MASTER"
       ],
       "approval": "mandatory_human"
+    },
+    {
+      "change_type": "company_master_aggregation",
+      "documents": [
+        "COMPANY_MASTER"
+      ],
+      "approval": "mandatory_human",
+      "required_roles": [
+        "company_reviewer"
+      ]
     }
   ],
   "never_auto_approve": [
@@ -106,8 +116,21 @@
     "D12",
     "D13",
     "D14",
-    "MASTER"
+    "MASTER",
+    "COMPANY_MASTER"
   ],
+  "role_approvals": {
+    "D01": ["authorized_human"],
+    "D03": ["pm_or_po"],
+    "D05": ["pm_or_po"],
+    "D07": ["cto_or_tech_lead"],
+    "D09": ["pm"],
+    "D12": ["authorized_human"],
+    "D13": ["authorized_human"],
+    "D14": ["authorized_human"],
+    "MASTER": ["policy_based", "authorized_human_for_restricted_sections"],
+    "COMPANY_MASTER": ["company_reviewer"]
+  },
   "always_human_fields": [
     "Prepared By",
     "Reviewed By",

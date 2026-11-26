@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UTDA Document Section Writer Output",
+  "type": "object",
+  "required": [
+    "document_id",
+    "section",
+    "content",
+    "evidence_refs",
+    "unknowns",
+    "proposed_change_summary"
+  ],
+  "properties": {
+    "document_id": {
+      "type": "string",
+      "enum": [
+        "D01",
+        "D02",
+        "D03",
+        "D04",
+        "D05",
+        "D06",
+        "D07",
+        "D08",
+        "D09",
+        "D10",
+        "D11",
+        "D12",
+        "D13",
+        "D14",
+        "D15",
+        "MASTER",
+        "COMPANY_MASTER"
+      ]
+    },
+    "section": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "unknowns": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "proposed_change_summary": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UTDA Company Master Record Aggregation Payload",
+  "type": "object",
+  "required": [
+    "aggregation_id",
+    "idempotency_key",
+    "target_document_id",
+    "source_project_id",
+    "source_document_id",
+    "source_commit_sha",
+    "source_version",
+    "aggregation_timestamp",
+    "evidence_refs",
+    "updates"
+  ],
+  "properties": {
+    "aggregation_id": {
+      "type": "string"
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "target_document_id": {
+      "const": "COMPANY_MASTER"
+    },
+    "source_project_id": {
+      "type": "string",
+      "pattern": "^[A-Z0-9][A-Z0-9_-]{2,31}$"
+    },
+    "source_document_id": {
+      "const": "MASTER"
+    },
+    "source_commit_sha": {
+      "type": "string",
+      "minLength": 7
+    },
+    "source_version": {
+      "type": "string"
+    },
+    "aggregation_timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "updates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "section",
+          "action",
+          "content",
+          "evidence_refs"
+        ],
+        "properties": {
+          "section": {
+            "type": "string"
+          },
+          "action": {
+            "enum": [
+              "replace_section",
+              "append_entry",
+              "update_table_rows",
+              "no_change"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "evidence_refs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

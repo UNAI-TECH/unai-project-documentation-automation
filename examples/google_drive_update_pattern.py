@@ -1,9 +1,17 @@
-"""Illustrative Drive API pattern. Add retries, backup and validation before production."""
+"""Illustrative GitHub-to-Drive synchronization pattern (Phase 6 reference only).
+
+Under GITHUB_AUTHORITY, Google Drive is NOT the source of truth:
+- DOCX updates are generated, validated, approved, and merged in GitHub first.
+- Only merged GitHub DOCX commits are synchronized to Drive on the same file_id.
+- Production drive_sync.py must add retries, pre-sync backup, SHA-256 verification,
+  out-of-band Drive drift detection, and audit DB recording before use.
+"""
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2 import service_account
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
 
 def drive_service(service_account_info: dict):
     creds = service_account.Credentials.from_service_account_info(
@@ -11,10 +19,11 @@ def drive_service(service_account_info: dict):
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def replace_existing_docx(service, file_id: str, local_docx_path: str):
-    """Updates media on the same Drive file ID; does not create a new file."""
+
+def sync_merged_docx_to_drive(service, file_id: str, local_merged_docx_path: str):
+    """Synchronizes an already-merged GitHub DOCX to the mapped Drive file ID."""
     media = MediaFileUpload(
-        local_docx_path,
+        local_merged_docx_path,
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         resumable=True,
     )
@@ -22,5 +31,5 @@ def replace_existing_docx(service, file_id: str, local_docx_path: str):
         fileId=file_id,
         media_body=media,
         supportsAllDrives=True,
-        fields="id,name,mimeType,modifiedTime,version",
+        fields="id,name,mimeType,modifiedTime,version,md5Checksum",
     ).execute()

@@ -9,32 +9,92 @@ on:
         required: false
         type: string
         default: documentation/reports/final
+      dry_run:
+        required: false
+        type: boolean
+        default: true
+      utda_ref:
+        required: false
+        type: string
+        default: v1
+      templates_ref:
+        required: false
+        type: string
+        default: templates-v1.0.0
     secrets:
       OPENROUTER_API_KEY:
         required: true
       GOOGLE_SERVICE_ACCOUNT_JSON:
-        required: true
+        required: false
+      UTDA_DATABASE_URL:
+        required: false
+      UTDA_APP_TOKEN:
+        required: false
 permissions:
   contents: read
   pull-requests: read
+  actions: read
+concurrency:
+  group: utda-${{ github.repository }}-${{ inputs.project_id }}
+  cancel-in-progress: false
 jobs:
   documentation:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout target application repository (Repo C)
+        uses: actions/checkout@v4
         with:
+          path: workspace/repo
           fetch-depth: 0
+      - name: Checkout central automation engine (Repo B)
+        uses: actions/checkout@v4
+        with:
+          repository: UNAI-TECH/unai-project-documentation-automation
+          ref: ${{ inputs.utda_ref }}
+          path: workspace/utda
+          token: ${{ secrets.UTDA_APP_TOKEN || secrets.GITHUB_TOKEN }}
+      - name: Checkout central master templates (Repo A)
+        uses: actions/checkout@v4
+        with:
+          repository: UNAI-TECH/unai-project-documentation
+          ref: ${{ inputs.templates_ref }}
+          path: workspace/templates
+          token: ${{ secrets.UTDA_APP_TOKEN || secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
+      - name: Install engine dependencies
+        working-directory: workspace/utda
+        run: pip install -r requirements.txt
       - name: Process event
+        working-directory: workspace/utda
         env:
           UTDA_PROJECT_ID: ${{ inputs.project_id }}
           UTDA_REPORT_PATH: ${{ inputs.report_path }}
+          UTDA_REPO_DIR: ${{ github.workspace }}/workspace/repo
+          UTDA_TEMPLATES_DIR: ${{ github.workspace }}/workspace/templates
+          UTDA_AUTHORITY_MODE: GITHUB_AUTHORITY
+          UTDA_MASTER_RECORD_SCOPE: BOTH
+          UTDA_REGISTRY_PATH: config/project_registry.json
+          UTDA_DRY_RUN: ${{ inputs.dry_run }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_SHARED_DRIVE_ID: ${{ vars.GOOGLE_DRIVE_SHARED_DRIVE_ID }}
+          UTDA_BACKUP_FOLDER_ID: ${{ vars.UTDA_BACKUP_FOLDER_ID }}
+          UTDA_DATABASE_URL: ${{ secrets.UTDA_DATABASE_URL }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}
-          UTDA_DRY_RUN: 'true'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FEATURE_ID: ${{ github.event.inputs.feature_id }}
         run: python -m engine.trigger
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: utda-run-${{ inputs.project_id }}-${{ github.run_id }}
+          path: workspace/utda/artifacts/
+          if-no-files-found: ignore

@@ -204,6 +204,8 @@
     }
   ],
   "master_record": {
+    "id": "MASTER",
+    "scope": "project",
     "filename": "Master Record.docx",
     "sections": [
       "Project identity and document control",
@@ -223,6 +225,22 @@
       "6.3 IT Asset Requirements",
       "7. Financial Overview"
     ],
-    "policy": "Update only from explicitly authorized project-management/HR/finance records; never infer personal, asset or financial data from source code."
+    "policy": "Project-level Master Record stored in each project repository under documentation/Project Documentation/Master Record.docx. Update only via GitHub PR workflow from verified project evidence; sensitive sections require authorized project-management/HR/finance records and human approval; never infer personal, asset or financial data from source code."
+  },
+  "company_master_record": {
+    "id": "COMPANY_MASTER",
+    "scope": "company",
+    "repository": "unai-company-master-record",
+    "filename": "Master Record.docx",
+    "sections": [
+      "Company Documentation Control & Registry Summary",
+      "1. Portfolio Overview",
+      "2. Project Status & Milestones",
+      "3. Approved Releases & Deployments",
+      "4. Cross-Project Dependencies & Risks",
+      "5. Key Technical & Business Decisions",
+      "6. Aggregation Provenance & Revision History"
+    ],
+    "policy": "Consolidated company-wide Master Record stored in unai-company-master-record. Derived incrementally from approved and merged project-level MASTER records with source commit SHA, version, timestamp and evidence provenance. Requires authorized company-level reviewer approval; never invent status or overwrite project-specific facts."
   }
 }

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UTDA Local Project Configuration (Repo C)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project_id",
+    "project_name",
+    "authority_mode",
+    "master_record_id",
+    "template_source",
+    "reports",
+    "docs_dir"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "project_id": {
+      "type": "string",
+      "pattern": "^[A-Z0-9][A-Z0-9_-]{2,31}$"
+    },
+    "project_name": {
+      "type": "string",
+      "minLength": 2
+    },
+    "authority_mode": {
+      "const": "GITHUB_AUTHORITY"
+    },
+    "master_record_id": {
+      "const": "MASTER"
+    },
+    "docs_dir": {
+      "const": "documentation/Project Documentation"
+    },
+    "template_source": {
+      "type": "object",
+      "required": [
+        "repository",
+        "version",
+        "manifest_path"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "manifest_path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reports": {
+      "type": "object",
+      "required": [
+        "final_dir",
+        "canonical_format"
+      ],
+      "properties": {
+        "final_dir": {
+          "const": "documentation/reports/final"
+        },
+        "canonical_format": {
+          "const": "json"
+        },
+        "companion_markdown": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "drive": {
+      "type": "object",
+      "properties": {
+        "folder_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "automation": {
+      "type": "object",
+      "properties": {
+        "reusable_workflow": {
+          "type": "string"
+        },
+        "dry_run_default": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -5,7 +5,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'documentation/reports/final/**'
+      - 'documentation/reports/final/*.json'
       - 'documentation/project-config.json'
   workflow_dispatch:
     inputs:
@@ -13,6 +13,11 @@ on:
         description: Feature/report identifier to process
         required: true
         type: string
+      dry_run:
+        description: Run without mutating GitHub PRs or Google Drive
+        required: false
+        default: true
+        type: boolean
 permissions:
   contents: read
   pull-requests: read
@@ -27,6 +32,7 @@ jobs:
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,13 +42,25 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements-utda.txt
-      - name: Resolve event and verify final report
+        run: pip install -r requirements.txt
+      - name: Resolve event and verify canonical JSON report
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           FEATURE_ID: ${{ inputs.feature_id }}
+          UTDA_AUTHORITY_MODE: GITHUB_AUTHORITY
+          UTDA_MASTER_RECORD_SCOPE: BOTH
+          UTDA_REGISTRY_PATH: config/project_registry.json
+          UTDA_DRY_RUN: ${{ inputs.dry_run != false }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          UTDA_DATABASE_URL: ${{ secrets.UTDA_DATABASE_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_SHARED_DRIVE_ID: ${{ vars.GOOGLE_DRIVE_SHARED_DRIVE_ID }}
+          UTDA_BACKUP_FOLDER_ID: ${{ vars.UTDA_BACKUP_FOLDER_ID }}
         run: python -m engine.trigger
       - name: Upload run artifacts
         if: always()

@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "authority_mode": "GITHUB_AUTHORITY",
+  "master_record_scope": "BOTH",
+  "company_master": {
+    "document_id": "COMPANY_MASTER",
+    "repository": "UNAI-TECH/unai-company-master-record",
+    "filename": "Master Record.docx",
+    "drive_file_id": ""
+  },
+  "projects": []
+}

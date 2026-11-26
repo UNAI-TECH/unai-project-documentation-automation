@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UTDA Project Registry Collection",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "authority_mode",
+    "master_record_scope",
+    "projects"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "authority_mode": {
+      "const": "GITHUB_AUTHORITY"
+    },
+    "master_record_scope": {
+      "const": "BOTH"
+    },
+    "company_master": {
+      "type": "object",
+      "required": [
+        "document_id",
+        "repository",
+        "filename"
+      ],
+      "properties": {
+        "document_id": {
+          "const": "COMPANY_MASTER"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "filename": {
+          "type": "string"
+        },
+        "drive_file_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "projects": {
+      "type": "array",
+      "items": {
+        "$ref": "project_registry.schema.json"
+      }
+    }
+  },
+  "additionalProperties": false
+}

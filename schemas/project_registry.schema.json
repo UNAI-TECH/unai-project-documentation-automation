@@ -26,6 +26,9 @@
         "archived"
       ]
     },
+    "template_version": {
+      "type": "string"
+    },
     "github": {
       "type": "object",
       "required": [
@@ -51,9 +54,14 @@
         },
         "report_path": {
           "type": "string",
-          "default": "documentation/reports/final/feature-report.md"
+          "default": "documentation/reports/final"
+        },
+        "docs_dir": {
+          "type": "string",
+          "default": "documentation/Project Documentation"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "drive": {
       "type": "object",
@@ -65,6 +73,9 @@
         "folder_id": {
           "type": "string"
         },
+        "backup_folder_id": {
+          "type": "string"
+        },
         "files": {
           "type": "object",
           "additionalProperties": {
@@ -74,7 +85,25 @@
         "template_folder_id": {
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
+    },
+    "master_record": {
+      "type": "object",
+      "properties": {
+        "document_id": {
+          "const": "MASTER"
+        },
+        "file_path": {
+          "type": "string",
+          "default": "documentation/Project Documentation/Master Record.docx"
+        },
+        "aggregation_enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
     },
     "policy": {
       "type": "object",
@@ -94,8 +123,18 @@
           "items": {
             "type": "string"
           }
+        },
+        "role_approvers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
-      }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

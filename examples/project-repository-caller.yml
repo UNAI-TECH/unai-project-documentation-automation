@@ -1,4 +1,4 @@
-# Copy to each participating project repository as .github/workflows/utda.yml
+# Copy to each participating project repository (Repo C) as .github/workflows/utda.yml
 name: Trigger UNAI Tech documentation automation
 on:
   pull_request:
@@ -6,15 +6,28 @@ on:
   push:
     branches: [main]
     paths:
-      - 'documentation/reports/final/**'
+      - 'documentation/reports/final/*.json'
+      - 'documentation/project-config.json'
+  workflow_dispatch:
+    inputs:
+      feature_id:
+        description: Feature/report identifier to process
+        required: true
+        type: string
+      dry_run:
+        description: Run in dry-run mode without mutating PRs or Drive
+        required: false
+        default: true
+        type: boolean
 permissions:
   contents: read
   pull-requests: read
 jobs:
   utda:
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
-    uses: unai-tech/unai-project-documentation-automation/.github/workflows/reusable-docs.yml@v1
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    uses: UNAI-TECH/unai-project-documentation-automation/.github/workflows/reusable-docs.yml@v1
     with:
       project_id: MY_PROJECT_ID
       report_path: documentation/reports/final
+      dry_run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}
     secrets: inherit
