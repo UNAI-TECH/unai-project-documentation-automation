@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UTDA Feature Implementation Report",
+  "type": "object",
+  "required": [
+    "project_id",
+    "feature_id",
+    "feature_name",
+    "change_type",
+    "summary",
+    "implementation_status",
+    "evidence"
+  ],
+  "properties": {
+    "project_id": {
+      "type": "string"
+    },
+    "feature_id": {
+      "type": "string"
+    },
+    "feature_name": {
+      "type": "string"
+    },
+    "change_type": {
+      "enum": [
+        "new_feature",
+        "feature_update",
+        "bug_fix",
+        "refactor",
+        "security_change",
+        "database_change",
+        "api_change",
+        "ui_change",
+        "deployment",
+        "test_execution",
+        "other"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "business_context": {
+      "type": "string"
+    },
+    "implementation_status": {
+      "enum": [
+        "implemented",
+        "partially_implemented",
+        "proposed",
+        "reverted"
+      ]
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "functional_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "technical_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "database_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "api_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "ui_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "security_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "result": {
+            "enum": [
+              "passed",
+              "failed",
+              "not_run",
+              "unknown"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "deployment_status": {
+      "enum": [
+        "not_deployed",
+        "staging",
+        "production",
+        "unknown"
+      ]
+    },
+    "known_issues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files_modified": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "reference"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "reference": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "unknowns": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

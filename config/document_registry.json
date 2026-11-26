@@ -1,0 +1,228 @@
+{
+  "schema_version": "1.0",
+  "documents": [
+    {
+      "id": "D01",
+      "filename": "01_Project_Charter.docx",
+      "title": "Project Charter",
+      "sections": [
+        "PROJECT PURPOSE & JUSTIFICATION",
+        "PROJECT OBJECTIVES",
+        "SCOPE (IN SCOPE)",
+        "OUT OF SCOPE",
+        "KEY MILESTONES",
+        "STAKEHOLDERS",
+        "HIGH-LEVEL RISKS & ASSUMPTIONS",
+        "BUDGET SUMMARY"
+      ],
+      "approval_policy": "Project sponsor / project manager approval; project identity and baseline scope are human-controlled."
+    },
+    {
+      "id": "D02",
+      "filename": "02_Project_Plan.docx",
+      "title": "Project Plan",
+      "sections": [
+        "PROJECT OVERVIEW",
+        "SCOPE & DELIVERABLES",
+        "PROJECT TIMELINE / PHASES",
+        "RESOURCE PLAN",
+        "COMMUNICATION PLAN",
+        "RISK MANAGEMENT PLAN",
+        "DEPENDENCIES"
+      ],
+      "approval_policy": "Timeline, resource allocation and approved commitments require owner confirmation."
+    },
+    {
+      "id": "D03",
+      "filename": "03_Software_Requirements_Specification.docx",
+      "title": "Software Requirements Specification (SRS)",
+      "sections": [
+        "INTRODUCTION",
+        "PURPOSE",
+        "SCOPE",
+        "DEFINITIONS, ACRONYMS & ABBREVIATIONS",
+        "FUNCTIONAL REQUIREMENTS",
+        "NON-FUNCTIONAL REQUIREMENTS",
+        "EXTERNAL INTERFACE REQUIREMENTS",
+        "ASSUMPTIONS & CONSTRAINTS"
+      ],
+      "approval_policy": "AI may propose requirements from evidence; product owner confirms requirement baselines."
+    },
+    {
+      "id": "D04",
+      "filename": "04_Business_Requirement_Document.docx",
+      "title": "Business Requirement Document (BRD)",
+      "sections": [
+        "BUSINESS OBJECTIVE",
+        "BACKGROUND",
+        "BUSINESS REQUIREMENTS",
+        "STAKEHOLDERS",
+        "ASSUMPTIONS",
+        "CONSTRAINTS",
+        "SUCCESS CRITERIA"
+      ],
+      "approval_policy": "Do not infer financial or commercial outcomes from code changes."
+    },
+    {
+      "id": "D05",
+      "filename": "05_Functional_Specification.docx",
+      "title": "Functional Specification",
+      "sections": [
+        "OVERVIEW",
+        "FUNCTIONAL REQUIREMENTS",
+        "USER ROLES & PERMISSIONS",
+        "USE CASES",
+        "WORKFLOW / PROCESS DESCRIPTION"
+      ],
+      "approval_policy": "Derive implemented behavior from code, tests and report; distinguish planned from implemented."
+    },
+    {
+      "id": "D06",
+      "filename": "06_Technical_Specification.docx",
+      "title": "Technical Specification",
+      "sections": [
+        "OVERVIEW",
+        "TECHNOLOGY STACK",
+        "SYSTEM COMPONENTS",
+        "DATA MODEL",
+        "API SPECIFICATIONS",
+        "SECURITY CONSIDERATIONS"
+      ],
+      "approval_policy": "Require code, migrations, API definitions or explicit report evidence for technical claims."
+    },
+    {
+      "id": "D07",
+      "filename": "07_Architecture_Document.docx",
+      "title": "Architecture Document",
+      "sections": [
+        "SYSTEM OVERVIEW",
+        "ARCHITECTURE DIAGRAM",
+        "COMPONENTS",
+        "DATA FLOW",
+        "TECHNOLOGY STACK",
+        "SCALABILITY & PERFORMANCE",
+        "SECURITY ARCHITECTURE"
+      ],
+      "approval_policy": "Only change architecture where repository evidence demonstrates a structural change."
+    },
+    {
+      "id": "D08",
+      "filename": "08_UI_UX_Design_Document.docx",
+      "title": "UI / UX Design Document",
+      "sections": [
+        "DESIGN OVERVIEW",
+        "DESIGN PRINCIPLES",
+        "SCREENS / WIREFRAMES",
+        "USER FLOW",
+        "STYLE GUIDE",
+        "ACCESSIBILITY CONSIDERATIONS"
+      ],
+      "approval_policy": "Do not invent screens, design specifications or accessibility validation."
+    },
+    {
+      "id": "D09",
+      "filename": "09_Sprint_Plan.docx",
+      "title": "Sprint Plan",
+      "sections": [
+        "SPRINT BACKLOG",
+        "TEAM CAPACITY",
+        "SPRINT RISKS / BLOCKERS"
+      ],
+      "approval_policy": "Sprint assignments, capacity and commitments require project-management source data."
+    },
+    {
+      "id": "D10",
+      "filename": "10_Test_Plan.docx",
+      "title": "Test Plan",
+      "sections": [
+        "SCOPE OF TESTING",
+        "TEST STRATEGY",
+        "TEST ENVIRONMENT",
+        "ENTRY & EXIT CRITERIA",
+        "ROLES & RESPONSIBILITIES",
+        "TEST SCHEDULE"
+      ],
+      "approval_policy": "Testing strategy may be proposed; test completion must be backed by execution evidence."
+    },
+    {
+      "id": "D11",
+      "filename": "11_Test_Cases.docx",
+      "title": "Test Cases",
+      "sections": [
+        "TEST CASES"
+      ],
+      "approval_policy": "Generate candidate cases; actual result and status require test-run evidence."
+    },
+    {
+      "id": "D12",
+      "filename": "12_UAT_Sign_off.docx",
+      "title": "UAT Sign-off",
+      "sections": [
+        "UAT SUMMARY",
+        "TEST SCENARIOS",
+        "ISSUES LOG",
+        "SIGN-OFF DECLARATION"
+      ],
+      "approval_policy": "Never create or imply business-owner acceptance or signatures."
+    },
+    {
+      "id": "D13",
+      "filename": "13_Deployment_Checklist.docx",
+      "title": "Deployment Checklist",
+      "sections": [
+        "PRE-DEPLOYMENT CHECKLIST",
+        "DEPLOYMENT STEPS",
+        "POST-DEPLOYMENT VERIFICATION",
+        "ROLLBACK PLAN"
+      ],
+      "approval_policy": "Only mark steps complete when deployment evidence exists."
+    },
+    {
+      "id": "D14",
+      "filename": "14_Go_Live_Checklist.docx",
+      "title": "Go-Live Checklist",
+      "sections": [
+        "READINESS CHECKLIST",
+        "COMMUNICATION PLAN",
+        "SUPPORT PLAN",
+        "GO / NO-GO DECISION"
+      ],
+      "approval_policy": "Go/no-go and sign-off are always human decisions."
+    },
+    {
+      "id": "D15",
+      "filename": "15_Maintenance_Plan.docx",
+      "title": "Maintenance Plan",
+      "sections": [
+        "MAINTENANCE SCOPE",
+        "MAINTENANCE SCHEDULE",
+        "SUPPORT LEVELS / SLA",
+        "ESCALATION MATRIX",
+        "CHANGE MANAGEMENT PROCESS"
+      ],
+      "approval_policy": "SLA, contacts, escalation owners and schedules require authorized source data."
+    }
+  ],
+  "master_record": {
+    "filename": "Master Record.docx",
+    "sections": [
+      "Project identity and document control",
+      "1. Project Overview",
+      "2. How It Is Done \u2014 Execution Approach",
+      "3. Team Structure",
+      "4. Team Change Log (Swaps / Exits)",
+      "5. Project Progress",
+      "6. Requirements",
+      "7. Financial Overview",
+      "8. Risks, Dependencies & Notes",
+      "9. Document Revision History"
+    ],
+    "sensitive_sections": [
+      "3. Team Structure",
+      "4. Team Change Log (Swaps / Exits)",
+      "6.3 IT Asset Requirements",
+      "7. Financial Overview"
+    ],
+    "policy": "Update only from explicitly authorized project-management/HR/finance records; never infer personal, asset or financial data from source code."
+  }
+}

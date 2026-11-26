@@ -1,0 +1,122 @@
+{
+  "schema_version": "1.0",
+  "rules": [
+    {
+      "change_type": "business_scope",
+      "documents": [
+        "D01",
+        "D02",
+        "D03",
+        "D04"
+      ],
+      "approval": "review"
+    },
+    {
+      "change_type": "functional_behavior",
+      "documents": [
+        "D03",
+        "D05",
+        "D10",
+        "D11"
+      ],
+      "approval": "routine"
+    },
+    {
+      "change_type": "api_or_backend",
+      "documents": [
+        "D06",
+        "D07",
+        "D10",
+        "D11",
+        "D15"
+      ],
+      "approval": "routine"
+    },
+    {
+      "change_type": "database_schema",
+      "documents": [
+        "D03",
+        "D06",
+        "D07",
+        "D10",
+        "D11",
+        "D15"
+      ],
+      "approval": "routine"
+    },
+    {
+      "change_type": "ui_ux",
+      "documents": [
+        "D05",
+        "D08",
+        "D10",
+        "D11"
+      ],
+      "approval": "routine"
+    },
+    {
+      "change_type": "sprint_or_schedule",
+      "documents": [
+        "D02",
+        "D09"
+      ],
+      "approval": "review"
+    },
+    {
+      "change_type": "test_execution",
+      "documents": [
+        "D10",
+        "D11"
+      ],
+      "approval": "routine"
+    },
+    {
+      "change_type": "uat",
+      "documents": [
+        "D12"
+      ],
+      "approval": "mandatory_human"
+    },
+    {
+      "change_type": "deployment",
+      "documents": [
+        "D13",
+        "D14",
+        "D15"
+      ],
+      "approval": "review"
+    },
+    {
+      "change_type": "go_live",
+      "documents": [
+        "D14"
+      ],
+      "approval": "mandatory_human"
+    },
+    {
+      "change_type": "team_or_finance",
+      "documents": [
+        "MASTER"
+      ],
+      "approval": "mandatory_human"
+    }
+  ],
+  "never_auto_approve": [
+    "D01",
+    "D12",
+    "D13",
+    "D14",
+    "MASTER"
+  ],
+  "always_human_fields": [
+    "Prepared By",
+    "Reviewed By",
+    "Approved By",
+    "Name",
+    "Signature",
+    "Date of approval",
+    "GO / NO-GO DECISION",
+    "SIGN-OFF DECLARATION",
+    "UAT acceptance"
+  ]
+}

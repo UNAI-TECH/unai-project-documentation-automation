@@ -1,0 +1,20 @@
+# Copy to each participating project repository as .github/workflows/utda.yml
+name: Trigger UNAI Tech documentation automation
+on:
+  pull_request:
+    types: [closed]
+  push:
+    branches: [main]
+    paths:
+      - 'documentation/reports/final/**'
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  utda:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    uses: unai-tech/unai-project-documentation-automation/.github/workflows/reusable-docs.yml@v1
+    with:
+      project_id: MY_PROJECT_ID
+      report_path: documentation/reports/final
+    secrets: inherit

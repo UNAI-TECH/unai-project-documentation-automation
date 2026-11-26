@@ -1,0 +1,53 @@
+name: UTDA documentation trigger
+on:
+  pull_request:
+    types: [closed]
+  push:
+    branches: [main]
+    paths:
+      - 'documentation/reports/final/**'
+      - 'documentation/project-config.json'
+  workflow_dispatch:
+    inputs:
+      feature_id:
+        description: Feature/report identifier to process
+        required: true
+        type: string
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+concurrency:
+  group: utda-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  trigger:
+    if: >
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements-utda.txt
+      - name: Resolve event and verify final report
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FEATURE_ID: ${{ inputs.feature_id }}
+        run: python -m engine.trigger
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: utda-run-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: ignore

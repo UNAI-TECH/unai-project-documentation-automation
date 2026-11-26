@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UTDA Project Registry Entry",
+  "type": "object",
+  "required": [
+    "project_id",
+    "project_name",
+    "github",
+    "drive"
+  ],
+  "properties": {
+    "project_id": {
+      "type": "string",
+      "pattern": "^[A-Z0-9][A-Z0-9_-]{2,31}$"
+    },
+    "project_name": {
+      "type": "string",
+      "minLength": 2
+    },
+    "status": {
+      "enum": [
+        "planning",
+        "active",
+        "on_hold",
+        "completed",
+        "archived"
+      ]
+    },
+    "github": {
+      "type": "object",
+      "required": [
+        "owner",
+        "repo",
+        "default_branch"
+      ],
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "default_branch": {
+          "type": "string"
+        },
+        "trigger_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "report_path": {
+          "type": "string",
+          "default": "documentation/reports/final/feature-report.md"
+        }
+      }
+    },
+    "drive": {
+      "type": "object",
+      "required": [
+        "folder_id",
+        "files"
+      ],
+      "properties": {
+        "folder_id": {
+          "type": "string"
+        },
+        "files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "template_folder_id": {
+          "type": "string"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "auto_publish_routine": {
+          "type": "boolean",
+          "default": true
+        },
+        "require_review_for": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_ai_data_classes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}
