@@ -1,10 +1,13 @@
 """Phase 1 end-to-end event lifecycle, correlation, duplicate, and retry/recovery tests."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -433,6 +436,231 @@ class Phase1EventPipelineTests(unittest.TestCase):
                 )
                 done = process_event(push_ev, repo_dir=repo, utda_dir=utda, audit=audit)
                 self.assertEqual(done["status"], "DRY_RUN_READY")
+                with db.transaction() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT COUNT(*) FROM utda.audit_events WHERE project_id = %s AND feature_id = %s",
+                            ("UTDA_PILOT", "FEAT-PG-501"),
+                        )
+                        self.assertGreaterEqual(cur.fetchone()[0], 2)
+
+                        # Verify expired stale IN_PROGRESS lock can be recovered
+                        cur.execute(
+                            """
+                            UPDATE utda.idempotency_keys
+                            SET status = 'IN_PROGRESS',
+                                expires_at = TIMEZONE('utc', NOW()) - INTERVAL '5 minutes'
+                            WHERE idempotency_key = %s
+                            """,
+                            (done["idempotency_key"],),
+                        )
+                recovered = audit.repo.acquire_idempotency_key(
+                    idempotency_key=done["idempotency_key"],
+                    scope="phase1_correlation",
+                    project_id="UTDA_PILOT",
+                    feature_id="FEAT-PG-501",
+                    report_blob_sha="sha-pg",
+                    target_document_id="PHASE1_CORRELATION",
+                )
+                self.assertTrue(recovered)
+
+    def test_github_event_parsing_from_webhook_payload_and_branch_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload_path = Path(tmp) / "event.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "repository": {"full_name": "UNAI-TECH/pilot-app"},
+                        "pull_request": {
+                            "number": 77,
+                            "merged": True,
+                            "title": "Implement [FEAT-404] audit exporter",
+                            "head": {"ref": "feat/FEAT-404-audit"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ev = normalize_event(
+                {
+                    "GITHUB_EVENT_NAME": "pull_request",
+                    "GITHUB_EVENT_PATH": str(payload_path),
+                    "GITHUB_SHA": "deadbeef",
+                }
+            )
+            self.assertEqual(ev.repository, "UNAI-TECH/pilot-app")
+            self.assertEqual(ev.pr_number, 77)
+            self.assertTrue(ev.pr_merged)
+            self.assertEqual(ev.feature_id, "FEAT-404")
+            self.assertTrue(ev.dry_run)
+
+            disp_path = Path(tmp) / "dispatch.json"
+            disp_path.write_text(
+                json.dumps({"inputs": {"feature_id": "FEAT-505"}}), encoding="utf-8"
+            )
+            disp_ev = normalize_event(
+                {
+                    "GITHUB_EVENT_NAME": "workflow_dispatch",
+                    "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                    "GITHUB_EVENT_PATH": str(disp_path),
+                    "UTDA_DRY_RUN": "true",
+                }
+            )
+            self.assertEqual(disp_ev.feature_id, "FEAT-505")
+            self.assertFalse(disp_ev.pr_merged)
+            self.assertTrue(disp_ev.dry_run)
+
+    def test_report_validation_edge_cases_and_audit_secret_redaction(self) -> None:
+        state = _FakeDBState()
+        state.tables_initialized = True
+        pool = _FakePool(state)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _init_temp_git_repo(base)
+            utda = _init_temp_utda_dir(base)
+            artifacts = base / "artifacts"
+
+            # Markdown-only report without canonical .json -> MISSING with hint
+            md_only = repo / "documentation" / "reports" / "final" / "FEAT-MD.md"
+            md_only.write_text("# Companion only\n", encoding="utf-8")
+
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+                audit = AuditStore(repo=UTDADatabaseRepository(db), artifacts_dir=artifacts)
+                ev_md = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": "HEAD",
+                        "PR_NUMBER": "81",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-MD",
+                        "UTDA_DELIVERY_ID": "deliv-md-only",
+                    }
+                )
+                res_md = process_event(ev_md, repo_dir=repo, utda_dir=utda, audit=audit)
+                self.assertEqual(res_md["status"], "WAITING_FOR_FINAL_REPORT")
+                self.assertIn("Markdown companion", state.audit_events[-1][-1])
+
+                # Production deployment claim without deployment evidence + synthetic secret in commit/summary
+                bad_dep_sha = _commit_json_report(
+                    repo,
+                    "FEAT-DEPLOY-BAD",
+                    {
+                        "project_id": "UTDA_PILOT",
+                        "feature_id": "FEAT-DEPLOY-BAD",
+                        "feature_name": "Prod Claim",
+                        "change_type": "deployment",
+                        "summary": "Leak test sk-secretkey12345678901234",
+                        "implementation_status": "implemented",
+                        "deployment_status": "production",
+                        "evidence": [{"kind": "commit", "reference": "ghp_123456789012345678901234567890"}],
+                    },
+                )
+                ev_dep = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "push",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": bad_dep_sha,
+                        "FEATURE_ID": "FEAT-DEPLOY-BAD",
+                        "UTDA_DELIVERY_ID": "deliv-bad-dep",
+                    }
+                )
+                res_dep = process_event(ev_dep, repo_dir=repo, utda_dir=utda, audit=audit)
+                self.assertEqual(res_dep["status"], "VALIDATION_FAILED")
+
+                # Explicitly verify secret redaction in audit_record.json and audit_events
+                audit.append_audit(
+                    actor="ci",
+                    event_type="REDACTION_CHECK",
+                    project_id="UTDA_PILOT",
+                    details={"raw": "postgresql://u:MySecretPw@host:5432/db sk-abcdefgh1234567890"},
+                )
+                audit.export_artifact(
+                    "audit_record.json",
+                    {"note": "ghp_123456789012345678901234567890 sk-abcdefgh1234567890 postgresql://u:MySecretPw@host:5432/db"},
+                )
+                artifact_text = (artifacts / "audit_record.json").read_text(encoding="utf-8")
+                self.assertNotIn("ghp_123456789012345678901234567890", artifact_text)
+                self.assertNotIn("MySecretPw", artifact_text)
+                self.assertIn("postgresql://u:***@host:5432/db", artifact_text)
+                self.assertNotIn("sk-abcdefgh1234567890", str(state.audit_events[-1]))
+
+    def test_phase1_blocks_docx_drive_publishing_and_provisioning(self) -> None:
+        # Confirm Phase 2-6 production modules do not exist and are never loaded
+        prohibited_modules = (
+            "engine.ai_generator",
+            "engine.document_updater",
+            "engine.pr_orchestrator",
+            "engine.provisioner",
+            "engine.master_aggregator",
+            "engine.drive_sync",
+        )
+        for mod in prohibited_modules:
+            self.assertNotIn(mod, sys.modules)
+            rel_py = ROOT / (mod.replace(".", "/") + ".py")
+            self.assertFalse(rel_py.exists(), f"Prohibited Phase 2+ module must not exist: {rel_py}")
+
+        state = _FakeDBState()
+        state.tables_initialized = True
+        pool = _FakePool(state)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _init_temp_git_repo(base)
+            utda = _init_temp_utda_dir(base)
+
+            docs_dir = repo / "documentation" / "Project Documentation"
+            docs_dir.mkdir(parents=True, exist_ok=True)
+            docx_file = docs_dir / "06_Technical_Specification.docx"
+            master_file = docs_dir / "Master Record.docx"
+            docx_file.write_bytes(b"ORIGINAL_DOCX_CONTENT_DO_NOT_TOUCH")
+            master_file.write_bytes(b"ORIGINAL_MASTER_CONTENT_DO_NOT_TOUCH")
+            before_docx = hashlib.sha256(docx_file.read_bytes()).hexdigest()
+            before_master = hashlib.sha256(master_file.read_bytes()).hexdigest()
+            before_reg = hashlib.sha256(
+                (utda / "config" / "project_registry.json").read_bytes()
+            ).hexdigest()
+
+            sha = _commit_json_report(
+                repo,
+                "FEAT-SAFE",
+                {
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-SAFE",
+                    "feature_name": "Safety Boundary",
+                    "change_type": "api_change",
+                    "summary": "Verify Phase 1 performs zero DOCX/Drive/PR writes.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "safe-1"}],
+                },
+            )
+            ev = normalize_event(
+                {
+                    "GITHUB_EVENT_NAME": "pull_request",
+                    "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                    "GITHUB_SHA": sha,
+                    "PR_NUMBER": "120",
+                    "UTDA_PR_MERGED": "true",
+                    "FEATURE_ID": "FEAT-SAFE",
+                    "UTDA_DELIVERY_ID": "deliv-safe-120",
+                    "UTDA_DRY_RUN": "true",
+                }
+            )
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+                audit = AuditStore(repo=UTDADatabaseRepository(db), artifacts_dir=base / "artifacts")
+                res = process_event(ev, repo_dir=repo, utda_dir=utda, audit=audit)
+                self.assertEqual(res["status"], "DRY_RUN_READY")
+                self.assertTrue(res["dry_run"])
+
+            self.assertEqual(hashlib.sha256(docx_file.read_bytes()).hexdigest(), before_docx)
+            self.assertEqual(hashlib.sha256(master_file.read_bytes()).hexdigest(), before_master)
+            self.assertEqual(
+                hashlib.sha256((utda / "config" / "project_registry.json").read_bytes()).hexdigest(),
+                before_reg,
+            )
+            for mod in prohibited_modules:
+                self.assertNotIn(mod, sys.modules)
 
 
 if __name__ == "__main__":

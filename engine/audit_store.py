@@ -27,6 +27,16 @@ def make_idempotency_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _scrub_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return scrub_secrets(value)
+    if isinstance(value, list):
+        return [_scrub_value(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _scrub_value(v) for k, v in value.items()}
+    return value
+
+
 class AuditStore:
     """Coordinates PostgreSQL persistence and sanitized CI artifact output."""
 
@@ -130,14 +140,14 @@ class AuditStore:
         self.repo.record_final_report(
             project_id=project_id,
             feature_id=report["feature_id"],
-            feature_name=report["feature_name"],
+            feature_name=scrub_secrets(report["feature_name"]),
             change_type=report["change_type"],
             implementation_status=report["implementation_status"],
             report_path=report_path,
             report_blob_sha=report_blob_sha,
             git_commit_sha=git_commit_sha,
-            report_metadata={"summary": report.get("summary", "")},
-            evidence_refs=report.get("evidence", []),
+            report_metadata={"summary": scrub_secrets(report.get("summary", ""))},
+            evidence_refs=_scrub_value(report.get("evidence", [])),
         )
 
     def claim_processing_lock(
@@ -188,12 +198,12 @@ class AuditStore:
             status="SUCCEEDED" if succeeded else "FAILED",
             retry_state=retry_state,
             error_code=error_code,
-            error_summary=error_summary,
+            error_summary=scrub_secrets(error_summary) if error_summary else None,
         )
         self.repo.complete_idempotency_key(
             idempotency_key=idempotency_key,
             status=final_key_status,
-            result_summary=result_summary,
+            result_summary=_scrub_value(result_summary) if result_summary else None,
         )
 
     def append_audit(
@@ -215,7 +225,7 @@ class AuditStore:
                 feature_id=feature_id,
                 document_id=document_id,
                 idempotency_key=idempotency_key,
-                details=details,
+                details=_scrub_value(details) if details else None,
             )
 
     def export_artifact(self, filename: str, payload: dict[str, Any]) -> Path | None:
