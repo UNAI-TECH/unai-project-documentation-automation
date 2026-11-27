@@ -1,9 +1,13 @@
 """Version-controlled PostgreSQL migration runner for UTDA.
 
-Refuses execution through Transaction Pooler connections (port 6543 /
-pool_mode='transaction'), verifies checksums and detects unknown DB versions,
-validates/quotes schema identifiers, and applies migrations atomically under a
-PostgreSQL session advisory lock.
+Security invariants:
+- UTDA_MIGRATION_DATABASE_URL is mandatory for --apply (never falls back to runtime DSN).
+- Verifies CURRENT_USER == 'utda_migrator' before applying migrations.
+- Validates TLS on the migration DSN independently.
+- Refuses execution through Transaction Pooler connections (port 6543 / transaction).
+- Validates and double-quotes schema identifiers.
+- Detects modified historical checksums and unknown DB migration versions.
+- Executes each migration atomically under a PostgreSQL session advisory lock.
 """
 from __future__ import annotations
 
@@ -28,10 +32,11 @@ from engine.db_config import (
 
 MIGRATION_FILENAME_RE = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 DEFAULT_MIGRATIONS_DIR = Path(__file__).resolve().parent
+REQUIRED_MIGRATION_ROLE = "utda_migrator"
 
 
 class MigrationError(RuntimeError):
-    """Raised when migration validation, locking, or execution fails."""
+    """Raised when migration validation, identity, locking, or execution fails."""
 
 
 class MigrationChecksumError(MigrationError):
@@ -117,6 +122,19 @@ def _rewrite_schema_prefix(sql: str, schema: str) -> str:
     return rewritten
 
 
+def _verify_migration_identity(conn: Any, *, allow_bootstrap_role: bool = False) -> str:
+    with conn.cursor() as cur:
+        cur.execute("SELECT CURRENT_USER")
+        row = cur.fetchone()
+    current_user = str(row[0]) if row else ""
+    if not allow_bootstrap_role and current_user != REQUIRED_MIGRATION_ROLE:
+        raise MigrationError(
+            f"Migration apply requires connected role '{REQUIRED_MIGRATION_ROLE}', "
+            f"but connected as '{current_user or '<unknown>'}'."
+        )
+    return current_user
+
+
 def _fetch_applied_migrations(conn: Any, schema: str) -> dict[str, tuple[str, str]]:
     safe_schema = validate_identifier(schema, kind="schema")
     quoted_table = f'{quote_ident(safe_schema, kind="schema")}."schema_migrations"'
@@ -181,9 +199,16 @@ def apply_migrations(
     dry_run: bool = True,
     applied_by: str = "utda-migrator",
     connect_fn: Any | None = None,
+    allow_bootstrap_role: bool = False,
 ) -> dict[str, Any]:
     """Plan or apply ordered SQL migrations atomically using a session advisory lock."""
     assert_migration_connection_supported(config)
+    if not dry_run and not config.migration_dsn:
+        raise MigrationError(
+            "UTDA_MIGRATION_DATABASE_URL is mandatory for migration apply operations; "
+            "falling back to runtime UTDA_DATABASE_URL is prohibited."
+        )
+
     safe_schema = validate_identifier(config.schema, kind="schema")
     quoted_table = f'{quote_ident(safe_schema, kind="schema")}."schema_migrations"'
     logger = configure_sanitized_logger("utda.migrations")
@@ -192,22 +217,28 @@ def apply_migrations(
     if connect_fn is None:
         import psycopg
 
-        target_dsn = config.migration_dsn or config.dsn
-        kwargs = config.connect_kwargs(for_migration=True)
+        target_dsn = config.migration_dsn if config.migration_dsn else config.dsn
+        kwargs = config.connect_kwargs(for_migration=bool(config.migration_dsn))
         conn_ctx = psycopg.connect(target_dsn, **kwargs)
     else:
         conn_ctx = connect_fn(config)
 
     applied_versions: list[str] = []
+    connected_user = ""
     lock_key = f"utda_mig:{safe_schema}"
     with conn_ctx as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_lock(hashtext(%s::text)::bigint)", (lock_key,))
         conn.commit()
         try:
+            if not dry_run:
+                connected_user = _verify_migration_identity(
+                    conn, allow_bootstrap_role=allow_bootstrap_role
+                )
+                conn.rollback()
+
             pending = plan_migrations(conn, safe_schema, migrations)
             if dry_run:
-                # Roll back any read-only snapshot transaction cleanly without modifying DB.
                 conn.rollback()
                 return {
                     "mode": "plan",
@@ -244,10 +275,11 @@ def apply_migrations(
                     committed = True
                     applied_versions.append(f"{migration.version}_{migration.name}")
                     logger.info(
-                        "Applied migration %s_%s (%dms)",
+                        "Applied migration %s_%s (%dms) as %s",
                         migration.version,
                         migration.name,
                         elapsed_ms,
+                        connected_user,
                     )
                 except Exception as exc:
                     conn.rollback()
@@ -286,6 +318,7 @@ def apply_migrations(
     return {
         "mode": "apply",
         "schema": safe_schema,
+        "connected_user": connected_user,
         "pending": [],
         "applied": applied_versions,
     }
@@ -300,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        config = DatabaseConfig.from_env()
+        config = DatabaseConfig.from_migration_env(require_migration_dsn=bool(args.apply))
         result = apply_migrations(
             config,
             dry_run=bool(args.plan),

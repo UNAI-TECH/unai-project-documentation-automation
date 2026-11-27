@@ -40,4 +40,4 @@ Defined in [0001_initial_utda_schema.sql](file:///c:/Users/kamal/OneDrive/Deskto
 | `utda.drive_file_mappings` | GitHub path ↔ Google Drive `file_id`, checksum & `drift_detected` | PK `(mapping_id)`, UNIQUE `(github_repository, document_id)`, UNIQUE `(drive_file_id)` |
 | `utda.drive_sync_revisions` | GitHub-to-Drive sync outcomes (`SYNCED`, `DRIFT_DETECTED`, `SYNC_FAILED`, `CONFLICT_ABORTED`) | PK `(sync_id)`, FK `mapping_id` |
 | `utda.rollback_operations` | GitHub & Drive rollback audit records | PK `(rollback_id)` |
-| `utda.audit_events` | Immutable UTC audit trail (`JSONB` details, no binaries/secrets) | PK `(event_id)` |
+| `utda.audit_events` | Role-enforced append-only UTC audit trail (`JSONB` details, no binaries/secrets) | PK `(event_id)` |

@@ -37,54 +37,107 @@ jobs:
           sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
-      - name: Verify fail-closed migration behavior when required roles are missing
+      - name: Generate masked ephemeral test passwords and isolated databases
+        run: |
+          MIG_PW="$(openssl rand -hex 16)"
+          RUN_PW="$(openssl rand -hex 16)"
+          GOV_PW="$(openssl rand -hex 16)"
+          API_PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$MIG_PW"
+          echo "::add-mask::$RUN_PW"
+          echo "::add-mask::$GOV_PW"
+          echo "::add-mask::$API_PW"
+          {
+            echo "MIG_PW=$MIG_PW"
+            echo "RUN_PW=$RUN_PW"
+            echo "GOV_PW=$GOV_PW"
+            echo "API_PW=$API_PW"
+          } >> "$GITHUB_ENV"
+      - name: Verify fail-closed checks (missing migration DSN, missing roles, non-migrator identity)
         env:
-          UTDA_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
+          ADMIN_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
           UTDA_DATABASE_SSLMODE: 'disable'
           UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
           UTDA_DRY_RUN: 'true'
         run: |
-          if python -m engine.migrations.runner --apply; then
-            echo "ERROR: migrations must fail closed when utda_migrator/utda_runtime/utda_governance roles are missing"
+          psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE utda_missing_roles_test;"
+          psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE utda_bootstrap_test;"
+          # 1. Missing UTDA_MIGRATION_DATABASE_URL must fail closed
+          if UTDA_DATABASE_URL="$ADMIN_DSN" python -m engine.migrations.runner --apply; then
+            echo "ERROR: runner --apply must fail without UTDA_MIGRATION_DATABASE_URL"
             exit 1
           fi
-          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT COUNT(*) FROM utda.schema_migrations WHERE version = '0002';" | grep -q "0"
-          echo "Missing-role fail-closed check passed."
-      - name: Provision least-privilege roles and apply migrations with ownership on PostgreSQL 16
+          # 2. Non-utda_migrator role must fail closed
+          if UTDA_MIGRATION_DATABASE_URL="$ADMIN_DSN" python -m engine.migrations.runner --apply; then
+            echo "ERROR: runner --apply must fail when not connected as utda_migrator"
+            exit 1
+          fi
+          # 3. Missing roles in 0002 must fail closed even under bootstrap
+          MISS_DSN="postgresql://utda_test:utda_test_password@localhost:5432/utda_missing_roles_test"
+          if UTDA_DATABASE_URL="$MISS_DSN" UTDA_MIGRATION_DATABASE_URL="$MISS_DSN" python -c "from engine.db_config import DatabaseConfig; from engine.migrations.runner import apply_migrations; apply_migrations(DatabaseConfig.from_migration_env(), dry_run=False, allow_bootstrap_role=True)"; then
+            echo "ERROR: 0002 must fail closed when required roles do not exist"
+            exit 1
+          fi
+          echo "Fail-closed checks passed."
+      - name: Provision roles and apply migrations directly as utda_migrator on PostgreSQL 16
         env:
-          UTDA_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
+          ADMIN_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
           UTDA_DATABASE_SSLMODE: 'disable'
           UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
           UTDA_DRY_RUN: 'true'
         run: |
-          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE utda_migrator NOINHERIT LOGIN PASSWORD 'mig_pw_test';"
-          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE utda_runtime NOINHERIT LOGIN PASSWORD 'run_pw_test';"
-          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE utda_governance NOINHERIT LOGIN PASSWORD 'gov_pw_test';"
-          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "GRANT utda_migrator TO utda_test;"
-          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "REVOKE CREATE ON SCHEMA public FROM utda_runtime, utda_governance;"
+          psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 <<SQL
+          CREATE ROLE utda_migrator NOINHERIT LOGIN PASSWORD '${MIG_PW}';
+          CREATE ROLE utda_runtime NOINHERIT LOGIN PASSWORD '${RUN_PW}';
+          CREATE ROLE utda_governance NOINHERIT LOGIN PASSWORD '${GOV_PW}';
+          CREATE ROLE anon NOINHERIT LOGIN PASSWORD '${API_PW}';
+          CREATE ROLE authenticated NOINHERIT LOGIN PASSWORD '${API_PW}';
+          CREATE SCHEMA IF NOT EXISTS utda AUTHORIZATION utda_migrator;
+          REVOKE CREATE ON SCHEMA public FROM utda_runtime, utda_governance, anon, authenticated;
+          GRANT utda_migrator TO utda_test;
+          SQL
+          MIG_DSN="postgresql://utda_migrator:${MIG_PW}@localhost:5432/utda_test_db"
+          RUN_DSN="postgresql://utda_runtime:${RUN_PW}@localhost:5432/utda_test_db"
+          export UTDA_DATABASE_URL="$RUN_DSN"
+          export UTDA_MIGRATION_DATABASE_URL="$MIG_DSN"
           python -m engine.migrations.runner --plan
           python -m engine.migrations.runner --apply
           python -m engine.db_health --json
-      - name: Run full Phase 0 and Phase 1 security and integration tests against PostgreSQL 16
+      - name: Run full Phase 0 and Phase 1 PostgreSQL 16 security checklist suite
         env:
           UTDA_TEST_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
-          UTDA_TEST_RUNTIME_URL: postgresql://utda_runtime:run_pw_test@localhost:5432/utda_test_db
-          UTDA_TEST_MIGRATOR_URL: postgresql://utda_migrator:mig_pw_test@localhost:5432/utda_test_db
-          UTDA_TEST_GOVERNANCE_URL: postgresql://utda_governance:gov_pw_test@localhost:5432/utda_test_db
+          UTDA_TEST_RUNTIME_URL: postgresql://utda_runtime:${{ env.RUN_PW }}@localhost:5432/utda_test_db
+          UTDA_TEST_MIGRATOR_URL: postgresql://utda_migrator:${{ env.MIG_PW }}@localhost:5432/utda_test_db
+          UTDA_TEST_GOVERNANCE_URL: postgresql://utda_governance:${{ env.GOV_PW }}@localhost:5432/utda_test_db
+          UTDA_TEST_BOOTSTRAP_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_bootstrap_test
           UTDA_DATABASE_SSLMODE: 'disable'
           UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
           UTDA_DRY_RUN: 'true'
-        run: python -m pytest -v -rs
-      - name: Verify pg_dump backup and pg_restore recovery on PostgreSQL 16
+        run: |
+          mkdir -p artifacts
+          set -o pipefail
+          python -m pytest -v -rs --junitxml=artifacts/pg16-junit.xml | tee artifacts/pg16-test-output.txt
+      - name: Verify pg_dump backup and pg_restore recovery (with rows and ownership) on PostgreSQL 16
         env:
           ADMIN_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
           RESTORE_DSN: postgresql://utda_test:utda_test_password@localhost:5432/utda_restore_verify
         run: |
           docker run --rm --network host -v "$PWD:/work" -w /work postgres:16-alpine pg_dump --version
-          docker run --rm --network host -v "$PWD:/work" -w /work postgres:16-alpine pg_dump --format=custom --schema=utda --no-owner --no-privileges "$ADMIN_DSN" -f utda_ci_backup.dump
+          docker run --rm --network host -v "$PWD:/work" -w /work postgres:16-alpine pg_dump --format=custom --schema=utda "$ADMIN_DSN" -f utda_ci_backup.dump
           psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE utda_restore_verify;"
-          docker run --rm --network host -v "$PWD:/work" -w /work postgres:16-alpine pg_restore --exit-on-error --dbname="$RESTORE_DSN" --no-owner --no-privileges utda_ci_backup.dump
+          docker run --rm --network host -v "$PWD:/work" -w /work postgres:16-alpine pg_restore --exit-on-error --dbname="$RESTORE_DSN" utda_ci_backup.dump
+          psql "$RESTORE_DSN" -v ON_ERROR_STOP=1 -c "SELECT version, status FROM utda.schema_migrations ORDER BY version;"
+          psql "$RESTORE_DSN" -v ON_ERROR_STOP=1 -c "SELECT project_id FROM utda.projects WHERE project_id = 'CI_SEC_TEST';" | grep -q "CI_SEC_TEST"
+          psql "$RESTORE_DSN" -v ON_ERROR_STOP=1 -c "SELECT event_type FROM utda.audit_events WHERE event_type = 'SEC_TEST_OK';" | grep -q "SEC_TEST_OK"
+          psql "$RESTORE_DSN" -v ON_ERROR_STOP=1 -c "SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname = 'utda';" | grep -q "utda_migrator"
           UTDA_DATABASE_URL="$RESTORE_DSN" UTDA_DATABASE_SSLMODE=disable UTDA_ALLOW_INSECURE_LOCAL_DB=true python -m engine.db_health --json
           rm -f utda_ci_backup.dump
       - name: Verify read-only Supabase probe defaults cleanly to pending when unset
         run: python -m engine.db_health --readonly-verify --json
+      - name: Upload CI test output artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: utda-pg16-security-ci-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: ignore

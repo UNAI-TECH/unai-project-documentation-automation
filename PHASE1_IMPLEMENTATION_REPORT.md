@@ -26,7 +26,7 @@
 
 1. **Privilege Hardening (`0002_roles_and_indexes.sql`):**
    - Removed `REVOKE ALL ON SCHEMA public` from inside the migration script (avoids permission failure when executed by non-superuser `utda_migrator`; documented for DBA owner setup in [DATABASE_SECURITY.md](file:///c:/Users/kamal/OneDrive/Desktop/utda_starter/DATABASE_SECURITY.md)).
-   - Revoked `DELETE` across all `utda.*` tables from `utda_runtime`, and revoked `UPDATE` on immutable audit/provenance tables (`audit_events`, `approval_records`, `rollback_operations`, `github_event_receipts`, `final_reports`, `schema_migrations`).
+   - Revoked `DELETE` across all `utda.*` tables from `utda_runtime`, and revoked `UPDATE` on role-enforced append-only audit/provenance tables (`audit_events`, `approval_records`, `rollback_operations`, `github_event_receipts`, `final_reports`, `schema_migrations`).
 2. **Schema Rewrite & Injection Safety (`runner.py`):**
    - Replaced substring schema replacement with word-boundary regex (`\butda\.`, `\bSCHEMA\s+(IF\s+NOT\s+EXISTS\s+)?utda\b`) and explicit `hashtext(%s::text)::bigint` casting.
    - Blocks execution on Transaction Pooler (`port=6543` / `pool_mode=transaction`) and enforces atomic per-migration rollback + session advisory locks.
