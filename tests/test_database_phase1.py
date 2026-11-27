@@ -20,12 +20,15 @@ from engine.database import (
 from engine.db_config import (
     DatabaseConfig,
     DatabaseConfigError,
+    quote_ident,
     redact_dsn,
+    validate_identifier,
 )
 from engine.db_health import check_database_health
 from engine.migrations.runner import (
     MigrationChecksumError,
     MigrationError,
+    UnknownMigrationError,
     apply_migrations,
     discover_migrations,
 )
@@ -70,7 +73,7 @@ class _FakeCursor:
         if state.fail_sql_substring and state.fail_sql_substring in sql:
             raise RuntimeError("Injected SQL failure")
 
-        norm = " ".join(sql.split())
+        norm = " ".join(sql.split()).replace('"', "")
         self._rows = []
         self._idx = 0
 
@@ -404,6 +407,46 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False, connect_fn=lambda _c: _FakeConnection(broken_state))
         self.assertNotIn("0002", broken_state.migrations)
 
+        # Unknown DB migration version absent from repo fails closed
+        drift_state = _FakeDBState()
+        drift_state.tables_initialized = True
+        drift_state.migrations["9999"] = ("deadbeef", "APPLIED")
+        with self.assertRaises(UnknownMigrationError):
+            apply_migrations(cfg, MIGRATIONS_DIR, dry_run=True, connect_fn=lambda _c: _FakeConnection(drift_state))
+
+        # Dry-run on empty DB leaves state completely unchanged
+        dry_state = _FakeDBState()
+        dry_res = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=True, connect_fn=lambda _c: _FakeConnection(dry_state))
+        self.assertEqual(dry_res["mode"], "plan")
+        self.assertFalse(dry_state.tables_initialized)
+        self.assertEqual(dry_state.migrations, {})
+
+        # Identifier validation rejects injection characters
+        with self.assertRaises(DatabaseConfigError):
+            validate_identifier("utda; DROP TABLE users", kind="schema")
+        self.assertEqual(quote_ident("utda_custom", kind="schema"), '"utda_custom"')
+
+        # Interrupted migration (KeyboardInterrupt) rolls back, releases advisory lock, and propagates
+        interrupt_state = _FakeDBState()
+        interrupt_conn = _FakeConnection(interrupt_state)
+        orig_execute = _FakeCursor.execute
+
+        def _interrupting_execute(cur_self, sql, params=()):
+            if "CREATE TABLE" in sql:
+                raise KeyboardInterrupt("Simulated SIGINT during migration")
+            return orig_execute(cur_self, sql, params)
+
+        old_exec = _FakeCursor.execute
+        _FakeCursor.execute = _interrupting_execute  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False, connect_fn=lambda _c: interrupt_conn)
+        finally:
+            _FakeCursor.execute = old_exec  # type: ignore[method-assign]
+        self.assertGreaterEqual(interrupt_conn.rolled_back, 1)
+        self.assertFalse(interrupt_state.tables_initialized)
+        self.assertTrue(any("pg_advisory_unlock" in s for s in interrupt_conn.executed_sql))
+
     def test_event_receipt_correlation_idempotency_concurrency_and_audit(self) -> None:
         state = _FakeDBState()
         state.tables_initialized = True
@@ -587,12 +630,237 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             with self.assertRaises(MigrationError):
                 apply_migrations(cfg, tmp_dir, dry_run=False)
 
+            # Advisory lock must be released after failed migration
+            with psycopg.connect(cfg.dsn, **cfg.connect_kwargs(for_migration=True)) as lock_chk:
+                with lock_chk.cursor() as cur:
+                    cur.execute("SELECT pg_try_advisory_lock(hashtext('utda_mig:utda')::bigint)")
+                    self.assertTrue(cur.fetchone()[0])
+                    cur.execute("SELECT pg_advisory_unlock(hashtext('utda_mig:utda')::bigint)")
+                    lock_chk.commit()
+
+            # Modified historical migration checksum must fail closed
+            (tmp_dir / "0001_initial_utda_schema.sql").write_text("-- tampered", encoding="utf-8")
+            with self.assertRaises(MigrationChecksumError):
+                apply_migrations(cfg, tmp_dir, dry_run=True)
+
+        # Dry-run in isolated schema does not create tables or alter DB state
+        dry_cfg = DatabaseConfig(
+            dsn=cfg.dsn,
+            schema="utda_dryrun_check",
+            pool_mode=cfg.pool_mode,
+            sslmode=cfg.sslmode,
+        )
+        dry_plan = apply_migrations(dry_cfg, MIGRATIONS_DIR, dry_run=True)
+        self.assertEqual(len(dry_plan["pending"]), 2)
+        with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as chk:
+            with chk.cursor() as cur:
+                cur.execute(
+                    "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'utda_dryrun_check'"
+                )
+                self.assertIsNone(cur.fetchone())
+
+        # Unknown DB migration version absent from repo fails closed
+        with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as unk_conn:
+            with unk_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO utda.schema_migrations (
+                        version, name, checksum_sha256, status, applied_by, execution_ms
+                    )
+                    VALUES ('9999', 'unknown_db_mig', 'abc', 'APPLIED', 'rogue', 1)
+                    """
+                )
+            unk_conn.commit()
+        try:
+            with self.assertRaises(UnknownMigrationError):
+                apply_migrations(cfg, MIGRATIONS_DIR, dry_run=True)
+        finally:
+            with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as cln:
+                with cln.cursor() as cur:
+                    cur.execute("DELETE FROM utda.schema_migrations WHERE version = '9999'")
+                cln.commit()
+
         with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as chk:
             with chk.cursor() as cur:
                 cur.execute(
                     "SELECT to_regclass('utda.should_not_exist')"
                 )
                 self.assertIsNone(cur.fetchone()[0])
+
+    @unittest.skipUnless(
+        os.getenv("UTDA_TEST_DATABASE_URL")
+        and os.getenv("UTDA_TEST_RUNTIME_URL")
+        and os.getenv("UTDA_TEST_MIGRATOR_URL")
+        and os.getenv("UTDA_TEST_GOVERNANCE_URL"),
+        "PG16 multi-role security tests require CI role DSNs (runs in ci-database.yml)",
+    )
+    def test_real_postgres_least_privilege_and_default_privileges(self) -> None:
+        import psycopg
+
+        runtime_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_RUNTIME_URL")
+        migrator_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_MIGRATOR_URL")
+        gov_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_GOVERNANCE_URL")
+
+        # 1. Runtime performs operational queries it actually requires
+        with DatabaseManager(runtime_cfg) as runtime_db:
+            health = check_database_health(runtime_db, read_only=True)
+            self.assertIn(health["status"], ("healthy", "warning"))
+            repo = UTDADatabaseRepository(runtime_db)
+            repo.upsert_project(
+                project_id="CI_SEC_TEST",
+                project_name="CI Security Test",
+                status="active",
+                github_owner="UNAI-TECH",
+                github_repo="ci-sec-test",
+                default_branch="main",
+            )
+            receipt = repo.record_event_receipt(
+                delivery_id="sec-deliv-1",
+                event_name="push",
+                repository="UNAI-TECH/ci-sec-test",
+                project_id="CI_SEC_TEST",
+                feature_id="FEAT-SEC",
+                git_sha="abc1234",
+            )
+            self.assertTrue(receipt["inserted"])
+            state = repo.correlate_feature_state(
+                project_id="CI_SEC_TEST",
+                feature_id="FEAT-SEC",
+                report_blob_sha="blob-sec",
+            )
+            self.assertEqual(state["status"], "AWAIT_PR_MERGE")
+            rep = repo.record_final_report(
+                project_id="CI_SEC_TEST",
+                feature_id="FEAT-SEC",
+                feature_name="Sec",
+                change_type="security_change",
+                implementation_status="implemented",
+                report_path="documentation/reports/final/FEAT-SEC.json",
+                report_blob_sha="blob-sec",
+                git_commit_sha="abc1234",
+                report_metadata={"summary": "sec"},
+                evidence_refs=[],
+            )
+            self.assertTrue(rep["inserted"])
+            self.assertTrue(
+                repo.acquire_idempotency_key(
+                    idempotency_key="ci-sec-idem-1",
+                    scope="sec_test",
+                    project_id="CI_SEC_TEST",
+                    feature_id="FEAT-SEC",
+                    report_blob_sha="blob-sec",
+                    target_document_id="D06",
+                )
+            )
+            repo.record_processing_attempt(
+                event_receipt_id=receipt["receipt_id"],
+                idempotency_key="ci-sec-idem-1",
+                attempt_number=1,
+                status="SUCCEEDED",
+            )
+            repo.complete_idempotency_key(
+                idempotency_key="ci-sec-idem-1",
+                status="COMPLETED",
+                result_summary={"ok": True},
+            )
+            repo.append_audit_event(
+                actor="utda_runtime",
+                event_type="SEC_TEST_OK",
+                project_id="CI_SEC_TEST",
+                feature_id="FEAT-SEC",
+            )
+
+        # 2. Runtime is blocked from prohibited DDL, approval/rollback writes, and immutable deletes/updates
+        blocked_runtime_sql = [
+            "CREATE SCHEMA illegal_utda_schema",
+            "CREATE TABLE utda.illegal_table (id INT)",
+            "INSERT INTO utda.approval_records (approval_id, project_id, document_id, section_id, change_id, approver_identity, approver_role, decision, evidence_reference) VALUES ('a1', 'CI_SEC_TEST', 'D06', 's', 'c', 'u', 'pm', 'approved', 'pr:1')",
+            "UPDATE utda.approval_records SET decision = 'rejected'",
+            "DELETE FROM utda.approval_records",
+            "INSERT INTO utda.rollback_operations (rollback_id, project_id, document_id, target_scope, restored_from_ref, restored_sha256, operator_identity, status) VALUES ('r1', 'CI_SEC_TEST', 'D06', 'GITHUB', 'ref', 'sha', 'u', 'DONE')",
+            "UPDATE utda.rollback_operations SET status = 'TAMPERED'",
+            "DELETE FROM utda.rollback_operations",
+            "UPDATE utda.audit_events SET actor = 'tamper'",
+            "DELETE FROM utda.audit_events",
+            "UPDATE utda.final_reports SET feature_name = 'tamper'",
+            "DELETE FROM utda.final_reports",
+            "INSERT INTO utda.schema_migrations (version, name, checksum_sha256, status, applied_by) VALUES ('9998', 'x', 'y', 'APPLIED', 'x')",
+            "UPDATE utda.schema_migrations SET status = 'FAILED'",
+            "DELETE FROM utda.schema_migrations",
+            "DELETE FROM utda.projects",
+            "INSERT INTO utda.document_proposals (proposal_id, project_id, feature_id, document_id, section_id, change_id, approval_class) VALUES ('p1', 'CI_SEC_TEST', 'F1', 'D06', 's', 'c', 'routine')",
+        ]
+        with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as rconn:
+            for stmt in blocked_runtime_sql:
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege, msg=f"Expected InsufficientPrivilege for: {stmt}"):
+                    with rconn.cursor() as cur:
+                        cur.execute(stmt)
+                rconn.rollback()
+
+            # Runtime CAN read approval_records & rollback_operations
+            with rconn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM utda.approval_records")
+                cur.execute("SELECT COUNT(*) FROM utda.rollback_operations")
+
+        # 3. Separately controlled utda_governance role CAN write approval_records & rollback_operations,
+        #    and CANNOT update/delete approval_records or audit_events or create tables.
+        with psycopg.connect(gov_cfg.dsn, **gov_cfg.connect_kwargs()) as gconn:
+            with gconn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO utda.approval_records (
+                        approval_id, project_id, document_id, section_id, change_id,
+                        approver_identity, approver_role, decision, evidence_reference
+                    )
+                    VALUES ('gov-a1', 'CI_SEC_TEST', 'D06', 'API', 'CHG-1', 'cto@unai.tech', 'cto_or_tech_lead', 'approved', 'pr:1')
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.rollback_operations (
+                        rollback_id, project_id, document_id, target_scope,
+                        restored_from_ref, restored_sha256, operator_identity, status
+                    )
+                    VALUES ('gov-r1', 'CI_SEC_TEST', 'D06', 'GITHUB', 'sha0', 'hash0', 'admin@unai.tech', 'COMPLETED')
+                    """
+                )
+            gconn.commit()
+
+            for stmt in (
+                "UPDATE utda.approval_records SET decision = 'rejected'",
+                "DELETE FROM utda.approval_records",
+                "DELETE FROM utda.rollback_operations",
+                "CREATE TABLE utda.gov_illegal (id INT)",
+            ):
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege, msg=f"Governance unexpectedly allowed: {stmt}"):
+                    with gconn.cursor() as cur:
+                        cur.execute(stmt)
+                gconn.rollback()
+
+        # 4. Future table created by utda_migrator receives SELECT-only default privilege for utda_runtime
+        with psycopg.connect(migrator_cfg.dsn, **migrator_cfg.connect_kwargs()) as mconn:
+            with mconn.cursor() as cur:
+                cur.execute("CREATE TABLE utda.future_priv_check (id INT PRIMARY KEY)")
+            mconn.commit()
+        try:
+            with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as rconn:
+                with rconn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM utda.future_priv_check")
+                rconn.commit()
+                for stmt in (
+                    "INSERT INTO utda.future_priv_check (id) VALUES (1)",
+                    "UPDATE utda.future_priv_check SET id = 2",
+                    "DELETE FROM utda.future_priv_check",
+                ):
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege, msg=f"Future table allowed: {stmt}"):
+                        with rconn.cursor() as cur:
+                            cur.execute(stmt)
+                    rconn.rollback()
+        finally:
+            with psycopg.connect(migrator_cfg.dsn, **migrator_cfg.connect_kwargs()) as mconn:
+                with mconn.cursor() as cur:
+                    cur.execute("DROP TABLE IF EXISTS utda.future_priv_check")
+                mconn.commit()
 
         with DatabaseManager(cfg) as db:
             health = check_database_health(db, read_only=True)

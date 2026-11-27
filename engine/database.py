@@ -18,7 +18,9 @@ import uuid
 from engine.db_config import (
     DatabaseConfig,
     configure_sanitized_logger,
+    quote_ident,
     sanitize_log_text,
+    validate_identifier,
 )
 
 T = TypeVar("T")
@@ -153,6 +155,7 @@ class DatabaseManager:
     def transaction(self) -> Iterator[Any]:
         """Acquire a connection, apply statement timeout, commit or roll back atomically."""
         with self.connection() as conn:
+            committed = False
             try:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -160,15 +163,16 @@ class DatabaseManager:
                     )
                 yield conn
                 conn.commit()
-            except BaseException:
-                try:
-                    conn.rollback()
-                except Exception as rb_err:
-                    self.logger.error(
-                        "Rollback encountered an error: %s",
-                        sanitize_log_text(str(rb_err)),
-                    )
-                raise
+                committed = True
+            finally:
+                if not committed:
+                    try:
+                        conn.rollback()
+                    except Exception as rb_err:
+                        self.logger.error(
+                            "Rollback encountered an error: %s",
+                            sanitize_log_text(str(rb_err)),
+                        )
 
     def run_in_transaction(self, fn: Callable[[Any], T]) -> T:
         """Run a transactional callback with transient connection retry safety."""
@@ -184,10 +188,10 @@ class UTDADatabaseRepository:
 
     def __init__(self, db: DatabaseManager) -> None:
         self.db = db
-        self.schema = db.config.schema
+        self.schema = validate_identifier(db.config.schema, kind="schema")
 
     def _tbl(self, name: str) -> str:
-        return f"{self.schema}.{name}"
+        return f"{quote_ident(self.schema, kind='schema')}.{quote_ident(name, kind='table')}"
 
     def upsert_project(
         self,
@@ -208,7 +212,7 @@ class UTDADatabaseRepository:
                 default_branch, drive_folder_id, template_version, registry_metadata,
                 updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, TIMEZONE('utc', NOW()))
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
             ON CONFLICT (project_id) DO UPDATE SET
                 project_name = EXCLUDED.project_name,
                 status = EXCLUDED.status,
@@ -218,7 +222,7 @@ class UTDADatabaseRepository:
                 drive_folder_id = EXCLUDED.drive_folder_id,
                 template_version = EXCLUDED.template_version,
                 registry_metadata = EXCLUDED.registry_metadata,
-                updated_at = TIMEZONE('utc', NOW())
+                updated_at = NOW()
         """
         payload = json.dumps(registry_metadata or {})
         def _op(conn: Any) -> None:
@@ -310,8 +314,8 @@ class UTDADatabaseRepository:
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
-                CASE WHEN %s::text IS NOT NULL AND %s::text IS NOT NULL THEN TIMEZONE('utc', NOW()) ELSE NULL END,
-                TIMEZONE('utc', NOW())
+                CASE WHEN %s::text IS NOT NULL AND %s::text IS NOT NULL THEN NOW() ELSE NULL END,
+                NOW()
             )
             ON CONFLICT (project_id, feature_id) DO UPDATE SET
                 pr_number = COALESCE(EXCLUDED.pr_number, {self._tbl('feature_processing_states')}.pr_number),
@@ -329,10 +333,10 @@ class UTDADatabaseRepository:
                 correlated_at = CASE
                     WHEN COALESCE(EXCLUDED.pr_merged_sha, {self._tbl('feature_processing_states')}.pr_merged_sha) IS NOT NULL
                      AND COALESCE(EXCLUDED.report_blob_sha, {self._tbl('feature_processing_states')}.report_blob_sha) IS NOT NULL
-                    THEN COALESCE({self._tbl('feature_processing_states')}.correlated_at, TIMEZONE('utc', NOW()))
+                    THEN COALESCE({self._tbl('feature_processing_states')}.correlated_at, NOW())
                     ELSE {self._tbl('feature_processing_states')}.correlated_at
                 END,
-                updated_at = TIMEZONE('utc', NOW())
+                updated_at = NOW()
             RETURNING state_id, status, pr_merged_sha, report_blob_sha
         """
         initial_status = force_status or (
@@ -389,18 +393,18 @@ class UTDADatabaseRepository:
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, 'IN_PROGRESS',
-                TIMEZONE('utc', NOW()),
-                TIMEZONE('utc', NOW()) + (%s::integer * INTERVAL '1 second')
+                NOW(),
+                NOW() + (%s::integer * INTERVAL '1 second')
             )
             ON CONFLICT (idempotency_key) DO UPDATE SET
                 status = 'IN_PROGRESS',
-                locked_at = TIMEZONE('utc', NOW()),
-                expires_at = TIMEZONE('utc', NOW()) + (%s::integer * INTERVAL '1 second')
+                locked_at = NOW(),
+                expires_at = NOW() + (%s::integer * INTERVAL '1 second')
             WHERE {tbl}.status = 'FAILED'
                OR (
                    {tbl}.status = 'IN_PROGRESS'
                    AND {tbl}.expires_at IS NOT NULL
-                   AND {tbl}.expires_at < TIMEZONE('utc', NOW())
+                   AND {tbl}.expires_at < NOW()
                )
             RETURNING idempotency_key
         """
@@ -476,7 +480,7 @@ class UTDADatabaseRepository:
         sql = f"""
             UPDATE {self._tbl('idempotency_keys')}
             SET status = %s,
-                completed_at = TIMEZONE('utc', NOW()),
+                completed_at = NOW(),
                 result_summary = %s::jsonb
             WHERE idempotency_key = %s
         """
@@ -505,7 +509,7 @@ class UTDADatabaseRepository:
                 attempt_id, event_receipt_id, idempotency_key, attempt_number,
                 status, retry_state, error_code, error_summary, started_at, finished_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TIMEZONE('utc', NOW()), TIMEZONE('utc', NOW()))
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
         """
         safe_error = sanitize_log_text(error_summary) if error_summary else None
 

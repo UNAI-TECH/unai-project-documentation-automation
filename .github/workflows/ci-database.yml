@@ -37,7 +37,20 @@ jobs:
           sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
-      - name: Create least-privilege roles and run migrations against PostgreSQL 16
+      - name: Verify fail-closed migration behavior when required roles are missing
+        env:
+          UTDA_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
+          UTDA_DATABASE_SSLMODE: 'disable'
+          UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
+          UTDA_DRY_RUN: 'true'
+        run: |
+          if python -m engine.migrations.runner --apply; then
+            echo "ERROR: migrations must fail closed when utda_migrator/utda_runtime/utda_governance roles are missing"
+            exit 1
+          fi
+          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT COUNT(*) FROM utda.schema_migrations WHERE version = '0002';" | grep -q "0"
+          echo "Missing-role fail-closed check passed."
+      - name: Provision least-privilege roles and apply migrations with ownership on PostgreSQL 16
         env:
           UTDA_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
           UTDA_DATABASE_SSLMODE: 'disable'
@@ -46,31 +59,18 @@ jobs:
         run: |
           psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE utda_migrator NOINHERIT LOGIN PASSWORD 'mig_pw_test';"
           psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE utda_runtime NOINHERIT LOGIN PASSWORD 'run_pw_test';"
+          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE utda_governance NOINHERIT LOGIN PASSWORD 'gov_pw_test';"
+          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "GRANT utda_migrator TO utda_test;"
+          psql "$UTDA_DATABASE_URL" -v ON_ERROR_STOP=1 -c "REVOKE CREATE ON SCHEMA public FROM utda_runtime, utda_governance;"
           python -m engine.migrations.runner --plan
           python -m engine.migrations.runner --apply
           python -m engine.db_health --json
-      - name: Verify least-privilege role enforcement on PostgreSQL 16
-        env:
-          RUNTIME_DSN: postgresql://utda_runtime:run_pw_test@localhost:5432/utda_test_db
-        run: |
-          psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM utda.schema_migrations;"
-          psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "INSERT INTO utda.audit_events (event_id, actor, event_type) VALUES ('ci-priv-test', 'ci', 'PRIV_CHECK');"
-          if psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "DELETE FROM utda.audit_events;" 2>/dev/null; then
-            echo "ERROR: utda_runtime must not be allowed to DELETE from utda.audit_events"
-            exit 1
-          fi
-          if psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "UPDATE utda.audit_events SET actor='tamper';" 2>/dev/null; then
-            echo "ERROR: utda_runtime must not be allowed to UPDATE utda.audit_events"
-            exit 1
-          fi
-          if psql "$RUNTIME_DSN" -v ON_ERROR_STOP=1 -c "CREATE TABLE utda.illegal_table (id int);" 2>/dev/null; then
-            echo "ERROR: utda_runtime must not be allowed to CREATE tables in utda"
-            exit 1
-          fi
-          echo "Least-privilege role verification passed."
-      - name: Run full Phase 0 and Phase 1 test suite against PostgreSQL 16
+      - name: Run full Phase 0 and Phase 1 security and integration tests against PostgreSQL 16
         env:
           UTDA_TEST_DATABASE_URL: postgresql://utda_test:utda_test_password@localhost:5432/utda_test_db
+          UTDA_TEST_RUNTIME_URL: postgresql://utda_runtime:run_pw_test@localhost:5432/utda_test_db
+          UTDA_TEST_MIGRATOR_URL: postgresql://utda_migrator:mig_pw_test@localhost:5432/utda_test_db
+          UTDA_TEST_GOVERNANCE_URL: postgresql://utda_governance:gov_pw_test@localhost:5432/utda_test_db
           UTDA_DATABASE_SSLMODE: 'disable'
           UTDA_ALLOW_INSECURE_LOCAL_DB: 'true'
           UTDA_DRY_RUN: 'true'

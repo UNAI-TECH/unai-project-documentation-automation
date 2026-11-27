@@ -1,8 +1,9 @@
 """Version-controlled PostgreSQL migration runner for UTDA.
 
 Refuses execution through Transaction Pooler connections (port 6543 /
-pool_mode='transaction'), verifies checksums of previously applied migrations,
-and applies each pending migration atomically inside a transaction.
+pool_mode='transaction'), verifies checksums and detects unknown DB versions,
+validates/quotes schema identifiers, and applies migrations atomically under a
+PostgreSQL session advisory lock.
 """
 from __future__ import annotations
 
@@ -15,12 +16,14 @@ import re
 import sys
 import time
 from typing import Any
-from urllib.parse import urlparse
 
 from engine.db_config import (
     DatabaseConfig,
     DatabaseConfigError,
     configure_sanitized_logger,
+    quote_ident,
+    sanitize_log_text,
+    validate_identifier,
 )
 
 MIGRATION_FILENAME_RE = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
@@ -33,6 +36,10 @@ class MigrationError(RuntimeError):
 
 class MigrationChecksumError(MigrationError):
     """Raised when an already-applied migration SQL file has been modified."""
+
+
+class UnknownMigrationError(MigrationError):
+    """Raised when the database contains migration versions absent from the repo."""
 
 
 @dataclass(frozen=True)
@@ -84,12 +91,26 @@ def assert_migration_connection_supported(config: DatabaseConfig) -> None:
 
 
 def _rewrite_schema_prefix(sql: str, schema: str) -> str:
-    if schema == "utda":
+    safe_schema = validate_identifier(schema, kind="schema")
+    if safe_schema == "utda":
         return sql
-    rewritten = re.sub(r"\butda\.", f"{schema}.", sql)
+    quoted = quote_ident(safe_schema, kind="schema")
+    rewritten = re.sub(r"\butda\.", f"{quoted}.", sql)
     rewritten = re.sub(
         r"\bSCHEMA\s+(IF\s+NOT\s+EXISTS\s+)?utda\b",
-        lambda m: f"SCHEMA {m.group(1) or ''}{schema}",
+        lambda m: f"SCHEMA {m.group(1) or ''}{quoted}",
+        rewritten,
+        flags=re.IGNORECASE,
+    )
+    rewritten = re.sub(
+        r"\bIN\s+SCHEMA\s+utda\b",
+        f"IN SCHEMA {quoted}",
+        rewritten,
+        flags=re.IGNORECASE,
+    )
+    rewritten = re.sub(
+        r"schemaname\s*=\s*'utda'",
+        f"schemaname = '{safe_schema}'",
         rewritten,
         flags=re.IGNORECASE,
     )
@@ -97,6 +118,8 @@ def _rewrite_schema_prefix(sql: str, schema: str) -> str:
 
 
 def _fetch_applied_migrations(conn: Any, schema: str) -> dict[str, tuple[str, str]]:
+    safe_schema = validate_identifier(schema, kind="schema")
+    quoted_table = f'{quote_ident(safe_schema, kind="schema")}."schema_migrations"'
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -106,13 +129,13 @@ def _fetch_applied_migrations(conn: Any, schema: str) -> dict[str, tuple[str, st
                 WHERE table_schema = %s AND table_name = 'schema_migrations'
             )
             """,
-            (schema,),
+            (safe_schema,),
         )
         exists_row = cur.fetchone()
         if not exists_row or not exists_row[0]:
             return {}
         cur.execute(
-            f"SELECT version, checksum_sha256, status FROM {schema}.schema_migrations ORDER BY version"
+            f"SELECT version, checksum_sha256, status FROM {quoted_table} ORDER BY version"
         )
         return {row[0]: (row[1], row[2]) for row in cur.fetchall()}
 
@@ -122,8 +145,18 @@ def plan_migrations(
     schema: str,
     migrations: list[MigrationFile],
 ) -> list[MigrationFile]:
-    """Compare discovered migrations against applied history and return pending files."""
-    applied = _fetch_applied_migrations(conn, schema)
+    """Compare repository migrations against applied DB history, failing on drift."""
+    safe_schema = validate_identifier(schema, kind="schema")
+    applied = _fetch_applied_migrations(conn, safe_schema)
+
+    repo_versions = {m.version for m in migrations}
+    unknown_versions = sorted(set(applied.keys()) - repo_versions)
+    if unknown_versions:
+        raise UnknownMigrationError(
+            "Database contains applied migration version(s) absent from repository: "
+            f"{unknown_versions}."
+        )
+
     pending: list[MigrationFile] = []
     for migration in migrations:
         if migration.version in applied:
@@ -151,6 +184,8 @@ def apply_migrations(
 ) -> dict[str, Any]:
     """Plan or apply ordered SQL migrations atomically using a session advisory lock."""
     assert_migration_connection_supported(config)
+    safe_schema = validate_identifier(config.schema, kind="schema")
+    quoted_table = f'{quote_ident(safe_schema, kind="schema")}."schema_migrations"'
     logger = configure_sanitized_logger("utda.migrations")
     migrations = discover_migrations(migrations_dir)
 
@@ -164,30 +199,35 @@ def apply_migrations(
         conn_ctx = connect_fn(config)
 
     applied_versions: list[str] = []
+    lock_key = f"utda_mig:{safe_schema}"
     with conn_ctx as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_lock(hashtext(%s::text)::bigint)", (f"utda_mig:{config.schema}",))
+            cur.execute("SELECT pg_advisory_lock(hashtext(%s::text)::bigint)", (lock_key,))
         conn.commit()
         try:
-            pending = plan_migrations(conn, config.schema, migrations)
+            pending = plan_migrations(conn, safe_schema, migrations)
             if dry_run:
+                # Roll back any read-only snapshot transaction cleanly without modifying DB.
+                conn.rollback()
                 return {
                     "mode": "plan",
-                    "schema": config.schema,
+                    "schema": safe_schema,
                     "pending": [f"{m.version}_{m.name}" for m in pending],
                     "applied": [],
                 }
 
             for migration in pending:
                 start = time.monotonic()
-                rendered_sql = _rewrite_schema_prefix(migration.sql, config.schema)
+                rendered_sql = _rewrite_schema_prefix(migration.sql, safe_schema)
+                committed = False
+                rolled_back = False
                 try:
                     with conn.cursor() as cur:
                         cur.execute(rendered_sql)
                         elapsed_ms = int((time.monotonic() - start) * 1000)
                         cur.execute(
                             f"""
-                            INSERT INTO {config.schema}.schema_migrations (
+                            INSERT INTO {quoted_table} (
                                 version, name, checksum_sha256, status, applied_by, execution_ms
                             )
                             VALUES (%s, %s, %s, 'APPLIED', %s, %s)
@@ -201,27 +241,51 @@ def apply_migrations(
                             ),
                         )
                     conn.commit()
+                    committed = True
                     applied_versions.append(f"{migration.version}_{migration.name}")
-                    logger.info("Applied migration %s_%s (%dms)", migration.version, migration.name, elapsed_ms)
-                except BaseException as exc:
+                    logger.info(
+                        "Applied migration %s_%s (%dms)",
+                        migration.version,
+                        migration.name,
+                        elapsed_ms,
+                    )
+                except Exception as exc:
                     conn.rollback()
+                    rolled_back = True
                     raise MigrationError(
-                        f"Migration {migration.version}_{migration.name} failed and was rolled back."
+                        f"Migration {migration.version}_{migration.name} failed and was rolled back: "
+                        f"{sanitize_log_text(str(exc))}"
                     ) from exc
+                finally:
+                    if not committed and not rolled_back:
+                        try:
+                            conn.rollback()
+                        except Exception as rb_err:
+                            logger.warning(
+                                "Rollback cleanup encountered an error: %s",
+                                sanitize_log_text(str(rb_err)),
+                            )
         finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             try:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT pg_advisory_unlock(hashtext(%s::text)::bigint)",
-                        (f"utda_mig:{config.schema}",),
+                        (lock_key,),
                     )
                 conn.commit()
-            except Exception:
-                pass
+            except Exception as unlock_err:
+                logger.warning(
+                    "Failed to release migration advisory lock: %s",
+                    sanitize_log_text(str(unlock_err)),
+                )
 
     return {
         "mode": "apply",
-        "schema": config.schema,
+        "schema": safe_schema,
         "pending": [],
         "applied": applied_versions,
     }

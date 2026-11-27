@@ -9,7 +9,13 @@ import time
 from typing import Any
 
 from engine.database import DatabaseManager, DatabaseUnavailableError
-from engine.db_config import DatabaseConfig, DatabaseConfigError, sanitize_log_text
+from engine.db_config import (
+    DatabaseConfig,
+    DatabaseConfigError,
+    quote_ident,
+    sanitize_log_text,
+    validate_identifier,
+)
 
 SUPABASE_FREE_QUOTA_BYTES = 500 * 1024 * 1024  # 500 MB
 WARN_PCT = 70.0
@@ -21,7 +27,8 @@ def check_database_health(
 ) -> dict[str, Any]:
     """Run connectivity, migration-status, and Free-Plan quota checks safely."""
     start = time.monotonic()
-    schema = db.config.schema
+    schema = validate_identifier(db.config.schema, kind="schema")
+    quoted_migrations = f'{quote_ident(schema, kind="schema")}."schema_migrations"'
 
     def _probe(conn: Any) -> dict[str, Any]:
         with conn.cursor() as cur:
@@ -48,7 +55,7 @@ def check_database_health(
             applied_count = 0
             if migrations_initialized:
                 cur.execute(
-                    f"SELECT version, COUNT(*) OVER () FROM {schema}.schema_migrations "
+                    f"SELECT version, COUNT(*) OVER () FROM {quoted_migrations} "
                     "WHERE status = 'APPLIED' ORDER BY version DESC LIMIT 1"
                 )
                 row = cur.fetchone()

@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS utda.schema_migrations (
     status VARCHAR(32) NOT NULL CHECK (status IN ('APPLIED', 'FAILED')),
     applied_by VARCHAR(128) NOT NULL,
     execution_ms INTEGER NOT NULL DEFAULT 0,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW())
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS utda.projects (
@@ -24,8 +24,8 @@ CREATE TABLE IF NOT EXISTS utda.projects (
     drive_folder_id VARCHAR(255) NOT NULL DEFAULT '',
     template_version VARCHAR(64) NOT NULL DEFAULT '',
     registry_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_projects_github_repo UNIQUE (github_owner, github_repo)
 );
 
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS utda.template_releases (
     version_tag VARCHAR(64) NOT NULL UNIQUE,
     commit_sha VARCHAR(64) NOT NULL,
     manifest JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW())
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS utda.project_provisioning_runs (
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS utda.project_provisioning_runs (
     status VARCHAR(32) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED', 'SKIPPED_DUPLICATE')),
     manifest_checksums JSONB NOT NULL DEFAULT '{}'::jsonb,
     error_summary TEXT,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ
 );
 
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS utda.github_event_receipts (
     pr_number INTEGER,
     report_blob_sha VARCHAR(64),
     payload_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW())
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS utda.feature_processing_states (
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS utda.feature_processing_states (
     pr_merged_sha VARCHAR(64),
     report_blob_sha VARCHAR(64),
     correlated_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_feature_state_project_feature UNIQUE (project_id, feature_id)
 );
 
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS utda.final_reports (
     git_commit_sha VARCHAR(64) NOT NULL,
     report_metadata JSONB NOT NULL,
     evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
-    validated_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    validated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_final_reports_blob UNIQUE (project_id, feature_id, report_blob_sha)
 );
 
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS utda.idempotency_keys (
     report_blob_sha VARCHAR(64) NOT NULL,
     target_document_id VARCHAR(32) NOT NULL,
     status VARCHAR(32) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED', 'SKIPPED')),
-    locked_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
     result_summary JSONB NOT NULL DEFAULT '{}'::jsonb
@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS utda.processing_attempts (
     next_retry_at TIMESTAMPTZ,
     error_code VARCHAR(64),
     error_summary TEXT,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at TIMESTAMPTZ,
     CONSTRAINT uq_attempt_key_num UNIQUE (idempotency_key, attempt_number)
 );
@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS utda.document_proposals (
     pre_docx_sha256 VARCHAR(64),
     post_docx_sha256 VARCHAR(64),
     proposal_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     merged_at TIMESTAMPTZ
 );
 
@@ -153,7 +153,7 @@ CREATE TABLE IF NOT EXISTS utda.approval_records (
     approver_role VARCHAR(64) NOT NULL,
     decision VARCHAR(32) NOT NULL CHECK (decision IN ('approved', 'rejected', 'changes_requested', 'auto_published')),
     evidence_reference VARCHAR(512) NOT NULL,
-    decided_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS utda.project_master_versions (
     docx_sha256 VARCHAR(64) NOT NULL,
     pr_number INTEGER,
     eligible_for_aggregation BOOLEAN NOT NULL DEFAULT TRUE,
-    merged_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    merged_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_project_master_commit UNIQUE (project_id, commit_sha)
 );
 
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS utda.company_aggregation_runs (
     target_merged_sha VARCHAR(64),
     status VARCHAR(32) NOT NULL,
     evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
-    aggregated_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW())
+    aggregated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS utda.drive_file_mappings (
@@ -210,7 +210,7 @@ CREATE TABLE IF NOT EXISTS utda.drive_sync_revisions (
     backup_drive_file_id VARCHAR(255),
     sync_status VARCHAR(32) NOT NULL CHECK (sync_status IN ('SYNCED', 'DRIFT_DETECTED', 'SYNC_FAILED', 'CONFLICT_ABORTED')),
     drift_details JSONB NOT NULL DEFAULT '{}'::jsonb,
-    synced_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW())
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS utda.rollback_operations (
@@ -223,12 +223,12 @@ CREATE TABLE IF NOT EXISTS utda.rollback_operations (
     operator_identity VARCHAR(255) NOT NULL,
     status VARCHAR(32) NOT NULL,
     details JSONB NOT NULL DEFAULT '{}'::jsonb,
-    executed_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW())
+    executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS utda.audit_events (
     event_id VARCHAR(64) PRIMARY KEY,
-    occurred_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     actor VARCHAR(255) NOT NULL,
     event_type VARCHAR(128) NOT NULL,
     project_id VARCHAR(32) REFERENCES utda.projects(project_id) ON DELETE SET NULL,

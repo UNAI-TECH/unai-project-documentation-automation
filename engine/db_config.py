@@ -26,6 +26,21 @@ class DatabaseConfigError(ValueError):
     """Raised when database configuration is missing, unsafe, or invalid."""
 
 
+def validate_identifier(name: str, kind: str = "identifier") -> str:
+    """Validate that a PostgreSQL schema/table identifier is safe to quote."""
+    if not isinstance(name, str) or not SCHEMA_NAME_RE.match(name):
+        raise DatabaseConfigError(
+            f"Unsafe PostgreSQL {kind}: must match ^[a-z_][a-z0-9_]{{0,62}}$."
+        )
+    return name
+
+
+def quote_ident(name: str, kind: str = "identifier") -> str:
+    """Validate and double-quote a PostgreSQL identifier."""
+    safe = validate_identifier(name, kind=kind)
+    return f'"{safe}"'
+
+
 def redact_dsn(dsn: str) -> str:
     """Return a PostgreSQL DSN with password and sensitive query params masked."""
     if not dsn:
