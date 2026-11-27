@@ -380,11 +380,17 @@ class Phase1EventPipelineTests(unittest.TestCase):
                 os.environ["UTDA_DATABASE_URL"] = prev
 
     @unittest.skipUnless(
-        os.getenv("UTDA_TEST_DATABASE_URL"),
-        "Local PostgreSQL UTDA_TEST_DATABASE_URL not set (runs in ci-database.yml)",
+        os.getenv("UTDA_TEST_DATABASE_URL") and os.getenv("UTDA_TEST_MIGRATOR_URL"),
+        "Local PostgreSQL UTDA_TEST_DATABASE_URL / UTDA_TEST_MIGRATOR_URL not set (runs in ci-database.yml)",
     )
     def test_real_postgres_full_event_correlation_and_recovery(self) -> None:
-        cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_DATABASE_URL")
+        cfg = DatabaseConfig.from_migration_env(
+            {
+                **os.environ,
+                "UTDA_DATABASE_URL": os.environ["UTDA_TEST_DATABASE_URL"],
+                "UTDA_MIGRATION_DATABASE_URL": os.environ["UTDA_TEST_MIGRATOR_URL"],
+            }
+        )
         apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False)
 
         with tempfile.TemporaryDirectory() as tmp:
