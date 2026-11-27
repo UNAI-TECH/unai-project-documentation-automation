@@ -687,6 +687,53 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 )
                 self.assertIsNone(cur.fetchone()[0])
 
+        with DatabaseManager(cfg) as db:
+            health = check_database_health(db, read_only=True)
+            self.assertIn(health["status"], ("healthy", "warning"))
+            repo = UTDADatabaseRepository(db)
+            repo.upsert_project(
+                project_id="CI_LOCAL_TEST",
+                project_name="CI Local Test",
+                status="active",
+                github_owner="UNAI-TECH",
+                github_repo="ci-local-test",
+                default_branch="main",
+            )
+            claimed = repo.acquire_idempotency_key(
+                idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
+                scope="ci_test",
+                project_id="CI_LOCAL_TEST",
+                feature_id="FEAT-CI",
+                report_blob_sha="sha1",
+                target_document_id="D06",
+            )
+            self.assertTrue(claimed)
+            self.assertFalse(
+                repo.acquire_idempotency_key(
+                    idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
+                    scope="ci_test",
+                    project_id="CI_LOCAL_TEST",
+                    feature_id="FEAT-CI",
+                    report_blob_sha="sha1",
+                    target_document_id="D06",
+                )
+            )
+            repo.complete_idempotency_key(
+                idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
+                status="FAILED",
+                result_summary={"error": "transient"},
+            )
+            self.assertTrue(
+                repo.acquire_idempotency_key(
+                    idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
+                    scope="ci_test",
+                    project_id="CI_LOCAL_TEST",
+                    feature_id="FEAT-CI",
+                    report_blob_sha="sha1",
+                    target_document_id="D06",
+                )
+            )
+
     @unittest.skipUnless(
         os.getenv("UTDA_TEST_DATABASE_URL")
         and os.getenv("UTDA_TEST_RUNTIME_URL")
@@ -861,55 +908,6 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 with mconn.cursor() as cur:
                     cur.execute("DROP TABLE IF EXISTS utda.future_priv_check")
                 mconn.commit()
-
-        with DatabaseManager(cfg) as db:
-            health = check_database_health(db, read_only=True)
-            self.assertIn(health["status"], ("healthy", "warning"))
-            repo = UTDADatabaseRepository(db)
-            repo.upsert_project(
-                project_id="CI_LOCAL_TEST",
-                project_name="CI Local Test",
-                status="active",
-                github_owner="UNAI-TECH",
-                github_repo="ci-local-test",
-                default_branch="main",
-            )
-            claimed = repo.acquire_idempotency_key(
-                idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
-                scope="ci_test",
-                project_id="CI_LOCAL_TEST",
-                feature_id="FEAT-CI",
-                report_blob_sha="sha1",
-                target_document_id="D06",
-            )
-            self.assertTrue(claimed)
-            # Duplicate claim blocked
-            self.assertFalse(
-                repo.acquire_idempotency_key(
-                    idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
-                    scope="ci_test",
-                    project_id="CI_LOCAL_TEST",
-                    feature_id="FEAT-CI",
-                    report_blob_sha="sha1",
-                    target_document_id="D06",
-                )
-            )
-            # Mark FAILED and verify recovery re-claims lock
-            repo.complete_idempotency_key(
-                idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
-                status="FAILED",
-                result_summary={"error": "transient"},
-            )
-            self.assertTrue(
-                repo.acquire_idempotency_key(
-                    idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
-                    scope="ci_test",
-                    project_id="CI_LOCAL_TEST",
-                    feature_id="FEAT-CI",
-                    report_blob_sha="sha1",
-                    target_document_id="D06",
-                )
-            )
 
     @unittest.skipUnless(
         os.getenv("UTDA_RUN_LIVE_SUPABASE_TESTS") == "true" and os.getenv("UTDA_DATABASE_URL"),
