@@ -119,6 +119,12 @@ def _rewrite_schema_prefix(sql: str, schema: str) -> str:
         rewritten,
         flags=re.IGNORECASE,
     )
+    rewritten = re.sub(
+        r"nspname\s*=\s*'utda'",
+        f"nspname = '{safe_schema}'",
+        rewritten,
+        flags=re.IGNORECASE,
+    )
     return rewritten
 
 

@@ -2,7 +2,13 @@
 -- Stores durable automation metadata, idempotency, correlation, approvals,
 -- Master Record provenance, and Drive sync metadata. No binary DOCX files.
 
-CREATE SCHEMA IF NOT EXISTS utda;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'utda') THEN
+        CREATE SCHEMA utda;
+    END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS utda.schema_migrations (
     version VARCHAR(32) PRIMARY KEY,
