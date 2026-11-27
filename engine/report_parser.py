@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable
 
 import jsonschema
 
 from engine.contracts import validate_against_schema
+from engine.sanitization import sanitize_log_text
 
 
 @dataclass(frozen=True)
@@ -51,39 +52,64 @@ def locate_and_parse_report(
     feature_id: str | None = None,
     expected_project_id: str | None = None,
     changed_files: tuple[str, ...] = (),
+    report_candidates: tuple[str, ...] | None = None,
+    blob_reader: Callable[[str], str] | None = None,
 ) -> ParsedReportResult:
-    """Locate canonical <feature-id>.json report and validate schema and evidence."""
+    """Locate canonical <feature-id>.json report from committed tree and validate schema/evidence."""
     norm_dir = report_dir.strip("/").replace("\\", "/")
     target_dir = repo_dir / norm_dir
 
-    candidate_path: Path | None = None
-    if feature_id:
-        explicit = target_dir / f"{feature_id}.json"
-        if explicit.is_file():
-            candidate_path = explicit
-    else:
-        changed_jsons = [
-            repo_dir / f
-            for f in changed_files
-            if f.startswith(f"{norm_dir}/") and f.endswith(".json") and (repo_dir / f).is_file()
-        ]
-        if len(changed_jsons) == 1:
-            candidate_path = changed_jsons[0]
-        elif len(changed_jsons) > 1:
-            return ParsedReportResult(
-                status="INVALID",
-                errors=("Multiple changed JSON reports found; specify feature_id explicitly.",),
-            )
-        elif target_dir.is_dir():
-            all_jsons = sorted(target_dir.glob("*.json"))
-            if len(all_jsons) == 1:
-                candidate_path = all_jsons[0]
-
-    if candidate_path is None:
-        md_hint = (
-            target_dir.is_dir()
-            and bool(list(target_dir.glob("*.md")))
+    selected_rel: str | None = None
+    if report_candidates is not None:
+        # Strict Git-tree mode: only examine committed JSON blobs from the requested commit.
+        committed = tuple(
+            p for p in report_candidates if p.startswith(f"{norm_dir}/") and p.endswith(".json")
         )
+        if feature_id:
+            target_rel = f"{norm_dir}/{feature_id}.json"
+            if target_rel in committed:
+                selected_rel = target_rel
+        else:
+            committed_set = set(committed)
+            changed_jsons = [
+                f
+                for f in changed_files
+                if f.startswith(f"{norm_dir}/") and f.endswith(".json") and f in committed_set
+            ]
+            if len(changed_jsons) == 1:
+                selected_rel = changed_jsons[0]
+            elif len(changed_jsons) > 1:
+                return ParsedReportResult(
+                    status="INVALID",
+                    errors=("Multiple changed JSON reports found; specify feature_id explicitly.",),
+                )
+            elif len(committed) == 1:
+                selected_rel = committed[0]
+    else:
+        if feature_id:
+            explicit = target_dir / f"{feature_id}.json"
+            if explicit.is_file():
+                selected_rel = explicit.relative_to(repo_dir).as_posix()
+        else:
+            changed_jsons = [
+                f
+                for f in changed_files
+                if f.startswith(f"{norm_dir}/") and f.endswith(".json") and (repo_dir / f).is_file()
+            ]
+            if len(changed_jsons) == 1:
+                selected_rel = changed_jsons[0]
+            elif len(changed_jsons) > 1:
+                return ParsedReportResult(
+                    status="INVALID",
+                    errors=("Multiple changed JSON reports found; specify feature_id explicitly.",),
+                )
+            elif target_dir.is_dir():
+                all_jsons = sorted(target_dir.glob("*.json"))
+                if len(all_jsons) == 1:
+                    selected_rel = all_jsons[0].relative_to(repo_dir).as_posix()
+
+    if selected_rel is None:
+        md_hint = target_dir.is_dir() and bool(list(target_dir.glob("*.md")))
         errs = (
             ("Markdown companion report found without canonical .json report.",)
             if md_hint
@@ -91,14 +117,17 @@ def locate_and_parse_report(
         )
         return ParsedReportResult(status="MISSING", errors=errs)
 
-    rel_path = candidate_path.relative_to(repo_dir).as_posix()
     try:
-        payload = json.loads(candidate_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        if blob_reader is not None:
+            raw_text = blob_reader(selected_rel)
+        else:
+            raw_text = (repo_dir / selected_rel).read_text(encoding="utf-8")
+        payload = json.loads(raw_text)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         return ParsedReportResult(
             status="INVALID",
-            report_path=rel_path,
-            errors=(f"Failed to parse JSON report {rel_path}: {exc}",),
+            report_path=selected_rel,
+            errors=(sanitize_log_text(f"Failed to parse JSON report {selected_rel}: {exc}"),),
         )
 
     try:
@@ -106,8 +135,8 @@ def locate_and_parse_report(
     except jsonschema.ValidationError as exc:
         return ParsedReportResult(
             status="INVALID",
-            report_path=rel_path,
-            errors=(f"Schema validation error: {exc.message}",),
+            report_path=selected_rel,
+            errors=(sanitize_log_text(f"Schema validation error: {exc.message}"),),
         )
 
     errors: list[str] = []
@@ -115,9 +144,10 @@ def locate_and_parse_report(
         errors.append(
             f"feature_id mismatch: expected '{feature_id}', found '{payload.get('feature_id')}'."
         )
-    if candidate_path.stem != payload.get("feature_id"):
+    candidate_stem = PurePosixPath(selected_rel).stem
+    if candidate_stem != payload.get("feature_id"):
         errors.append(
-            f"Filename stem '{candidate_path.stem}' does not match feature_id '{payload.get('feature_id')}'."
+            f"Filename stem '{candidate_stem}' does not match feature_id '{payload.get('feature_id')}'."
         )
     if expected_project_id and payload.get("project_id") != expected_project_id:
         errors.append(
@@ -129,8 +159,8 @@ def locate_and_parse_report(
         return ParsedReportResult(
             status="INVALID",
             report=payload,
-            report_path=rel_path,
-            errors=tuple(errors),
+            report_path=selected_rel,
+            errors=tuple(sanitize_log_text(e) for e in errors),
         )
 
-    return ParsedReportResult(status="VALID", report=payload, report_path=rel_path)
+    return ParsedReportResult(status="VALID", report=payload, report_path=selected_rel)

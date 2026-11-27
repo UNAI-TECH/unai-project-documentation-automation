@@ -4,6 +4,7 @@ connection lifecycle, idempotency, concurrency, health checks, and safe logging.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import logging
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import unittest
 
 from engine.database import (
     TRANSIENT_ERRORS,
+    CommitOutcomeUnknownError,
     DatabaseManager,
     DatabaseUnavailableError,
     UTDADatabaseRepository,
@@ -24,6 +26,7 @@ from engine.db_config import (
     redact_dsn,
     validate_identifier,
 )
+from engine.sanitization import sanitize_log_text, sanitize_value
 from engine.db_health import check_database_health
 from engine.migrations.runner import (
     MigrationChecksumError,
@@ -51,10 +54,11 @@ class _FakeDBState:
         self.migrations: dict[str, tuple[str, str]] = {}
         self.projects: dict[str, dict] = {}
         self.receipts_by_delivery: dict[str, str] = {}
+        self.receipt_payloads: dict[str, dict] = {}
         self.feature_states: dict[tuple[str, str], dict] = {}
         self.final_reports: set[tuple[str, str, str]] = set()
         self.idempotency_keys: dict[str, dict] = {}
-        self.attempts: list[tuple] = []
+        self.attempts: list[dict] = []
         self.audit_events: list[tuple] = []
         self.fail_sql_substring = fail_sql_substring
         self.size_bytes = 12 * 1024 * 1024  # 12 MB
@@ -122,17 +126,25 @@ class _FakeCursor:
             self.conn.pending_ops.append(("project", params[0]))
             return
         if "INSERT INTO" in norm and ".github_event_receipts" in norm:
+            import json as _json
+
             receipt_id, delivery_id = params[0], params[1]
+            payload_summary = _json.loads(params[9])
             with state.lock:
                 if delivery_id in state.receipts_by_delivery:
                     self._rows = []
                 else:
+                    self.conn.undo_ops.append(("receipt", delivery_id))
                     state.receipts_by_delivery[delivery_id] = receipt_id
+                    state.receipt_payloads[delivery_id] = payload_summary
                     self._rows = [(receipt_id,)]
             return
         if "INSERT INTO" in norm and ".feature_processing_states" in norm:
             state_id, project_id, feature_id, _init, pr_num, pr_sha, rep_sha = params[:7]
             with state.lock:
+                self.conn.undo_ops.append(
+                    ("feature_state", (project_id, feature_id), copy.deepcopy(state.feature_states.get((project_id, feature_id))))
+                )
                 existing = state.feature_states.get((project_id, feature_id), {})
                 merged_pr = pr_sha or existing.get("pr_merged_sha")
                 merged_rep = rep_sha or existing.get("report_blob_sha")
@@ -158,6 +170,7 @@ class _FakeCursor:
                 if key in state.final_reports:
                     self._rows = []
                 else:
+                    self.conn.undo_ops.append(("final_report", key))
                     state.final_reports.add(key)
                     self._rows = [(report_id,)]
             return
@@ -165,17 +178,75 @@ class _FakeCursor:
             idem_key = params[0]
             with state.lock:
                 existing = state.idempotency_keys.get(idem_key)
-                if existing is None or existing.get("status") == "FAILED":
-                    state.idempotency_keys[idem_key] = {"status": "IN_PROGRESS"}
+                can_claim = (
+                    existing is None
+                    or existing.get("status") == "FAILED"
+                    or (existing.get("status") == "IN_PROGRESS" and existing.get("expired"))
+                )
+                if can_claim:
+                    self.conn.undo_ops.append(("idem_key", idem_key, copy.deepcopy(existing)))
+                    state.idempotency_keys[idem_key] = {"status": "IN_PROGRESS", "expired": False}
                     self._rows = [(idem_key,)]
                 else:
                     self._rows = []
             return
+        if "UPDATE" in norm and ".processing_attempts" in norm and "LOCK_EXPIRED" in norm:
+            idem_key = params[0]
+            with state.lock:
+                self.conn.undo_ops.append(("attempts_snapshot", copy.deepcopy(state.attempts)))
+                for att in state.attempts:
+                    if att["idempotency_key"] == idem_key and att["status"] == "IN_PROGRESS":
+                        att["status"] = "FAILED"
+                        att["retry_state"] = "LOCK_EXPIRED"
+            return
+        if "INSERT INTO" in norm and ".processing_attempts" in norm and "COALESCE(MAX(attempt_number)" in norm:
+            attempt_id, event_receipt_id, idem_key, _where_key = params
+            with state.lock:
+                self.conn.undo_ops.append(("attempts_snapshot", copy.deepcopy(state.attempts)))
+                existing_nums = [
+                    a["attempt_number"] for a in state.attempts if a["idempotency_key"] == idem_key
+                ]
+                next_num = max(existing_nums, default=0) + 1
+                if any(
+                    a["idempotency_key"] == idem_key and a["attempt_number"] == next_num
+                    for a in state.attempts
+                ):
+                    raise RuntimeError("uq_attempt_key_num violation")
+                state.attempts.append(
+                    {
+                        "attempt_id": attempt_id,
+                        "event_receipt_id": event_receipt_id,
+                        "idempotency_key": idem_key,
+                        "attempt_number": next_num,
+                        "status": "IN_PROGRESS",
+                        "retry_state": "NONE",
+                        "error_code": None,
+                        "error_summary": None,
+                    }
+                )
+                self._rows = [(attempt_id, next_num)]
+            return
+        if "UPDATE" in norm and ".processing_attempts" in norm:
+            attempt_status, retry_state, error_code, error_summary, idem_key, attempt_number = params
+            with state.lock:
+                self.conn.undo_ops.append(("attempts_snapshot", copy.deepcopy(state.attempts)))
+                for att in state.attempts:
+                    if att["idempotency_key"] == idem_key and att["attempt_number"] == attempt_number:
+                        att["status"] = attempt_status
+                        att["retry_state"] = retry_state
+                        att["error_code"] = error_code
+                        att["error_summary"] = error_summary
+                        self._rows = [(att["attempt_id"],)]
+                        return
+                self._rows = []
+            return
         if "SELECT COALESCE(MAX(attempt_number), 0) + 1" in norm and ".processing_attempts" in norm:
             idem_key = params[0]
             with state.lock:
-                cnt = sum(1 for a in state.attempts if a[2] == idem_key)
-                self._rows = [(cnt + 1,)]
+                existing_nums = [
+                    a["attempt_number"] for a in state.attempts if a["idempotency_key"] == idem_key
+                ]
+                self._rows = [(max(existing_nums, default=0) + 1,)]
             return
         if "SELECT state_id, status, pr_number, pr_merged_sha, report_blob_sha" in norm:
             project_id, feature_id = params[0], params[1]
@@ -193,13 +264,43 @@ class _FakeCursor:
                     ]
             return
         if "UPDATE" in norm and ".idempotency_keys" in norm:
-            status, _summary, idem_key = params
+            import json as _json
+
+            status, summary_json, idem_key = params
             with state.lock:
                 if idem_key in state.idempotency_keys:
+                    self.conn.undo_ops.append(
+                        ("idem_key", idem_key, copy.deepcopy(state.idempotency_keys.get(idem_key)))
+                    )
                     state.idempotency_keys[idem_key]["status"] = status
+                    state.idempotency_keys[idem_key]["expired"] = False
+                    state.idempotency_keys[idem_key]["result_summary"] = _json.loads(summary_json)
+                    self._rows = [(idem_key,)]
+                else:
+                    self._rows = []
             return
         if "INSERT INTO" in norm and ".processing_attempts" in norm:
-            self.conn.pending_ops.append(("attempt", params))
+            attempt_id, event_receipt_id, idem_key, attempt_number, attempt_status, retry_state, error_code, error_summary = params
+            with state.lock:
+                self.conn.undo_ops.append(("attempts_snapshot", copy.deepcopy(state.attempts)))
+                if any(
+                    a["idempotency_key"] == idem_key and a["attempt_number"] == attempt_number
+                    for a in state.attempts
+                ):
+                    raise RuntimeError("uq_attempt_key_num violation")
+                state.attempts.append(
+                    {
+                        "attempt_id": attempt_id,
+                        "event_receipt_id": event_receipt_id,
+                        "idempotency_key": idem_key,
+                        "attempt_number": attempt_number,
+                        "status": attempt_status,
+                        "retry_state": retry_state,
+                        "error_code": error_code,
+                        "error_summary": error_summary,
+                    }
+                )
+                self._rows = [(attempt_id,)]
             return
         if "INSERT INTO" in norm and ".audit_events" in norm:
             self.conn.pending_ops.append(("audit", params))
@@ -217,11 +318,13 @@ class _FakeCursor:
 
 
 class _FakeConnection:
-    def __init__(self, state: _FakeDBState) -> None:
+    def __init__(self, state: _FakeDBState, pool: "_FakePool | None" = None) -> None:
         self.state = state
+        self.pool = pool
         self.committed = 0
         self.rolled_back = 0
         self.pending_ops: list[tuple[str, object]] = []
+        self.undo_ops: list[tuple] = []
         self.executed_sql: list[str] = []
 
     def __enter__(self) -> "_FakeConnection":
@@ -234,7 +337,18 @@ class _FakeConnection:
         return _FakeCursor(self)
 
     def commit(self) -> None:
+        if self.pool is not None and self.pool.fail_commit_times > 0:
+            self.pool.fail_commit_calls += 1
+            if self.pool.fail_commit_calls <= self.pool.fail_commit_times:
+                # Clear undo_ops if configured to simulate server-side commit before client drop
+                if self.pool.commit_drops_after_apply:
+                    self._apply_pending()
+                err_cls = TRANSIENT_ERRORS[0]
+                raise err_cls("Simulated transient drop during COMMIT")
         self.committed += 1
+        self._apply_pending()
+
+    def _apply_pending(self) -> None:
         with self.state.lock:
             for kind, payload in self.pending_ops:
                 if kind == "init_tables":
@@ -244,22 +358,54 @@ class _FakeConnection:
                     self.state.migrations[version] = (checksum, "APPLIED")
                 elif kind == "project":
                     self.state.projects[str(payload)] = {}
-                elif kind == "attempt":
-                    self.state.attempts.append(payload)  # type: ignore[arg-type]
                 elif kind == "audit":
                     self.state.audit_events.append(payload)  # type: ignore[arg-type]
             self.pending_ops.clear()
+            self.undo_ops.clear()
 
     def rollback(self) -> None:
         self.rolled_back += 1
-        self.pending_ops.clear()
+        with self.state.lock:
+            for undo in reversed(self.undo_ops):
+                kind = undo[0]
+                if kind == "receipt":
+                    did = undo[1]
+                    self.state.receipts_by_delivery.pop(did, None)
+                    self.state.receipt_payloads.pop(did, None)
+                elif kind == "feature_state":
+                    fkey, prev = undo[1], undo[2]
+                    if prev is None:
+                        self.state.feature_states.pop(fkey, None)
+                    else:
+                        self.state.feature_states[fkey] = prev
+                elif kind == "final_report":
+                    self.state.final_reports.discard(undo[1])
+                elif kind == "idem_key":
+                    ikey, prev = undo[1], undo[2]
+                    if prev is None:
+                        self.state.idempotency_keys.pop(ikey, None)
+                    else:
+                        self.state.idempotency_keys[ikey] = prev
+                elif kind == "attempts_snapshot":
+                    self.state.attempts = undo[1]
+            self.undo_ops.clear()
+            self.pending_ops.clear()
 
 
 class _FakePool:
-    def __init__(self, state: _FakeDBState, fail_connect_times: int = 0) -> None:
+    def __init__(
+        self,
+        state: _FakeDBState,
+        fail_connect_times: int = 0,
+        fail_commit_times: int = 0,
+        commit_drops_after_apply: bool = False,
+    ) -> None:
         self.state = state
         self.fail_connect_times = fail_connect_times
+        self.fail_commit_times = fail_commit_times
+        self.commit_drops_after_apply = commit_drops_after_apply
         self.connect_calls = 0
+        self.fail_commit_calls = 0
         self.opened = False
         self.closed = False
         self.connections: list[_FakeConnection] = []
@@ -279,7 +425,7 @@ class _FakePool:
                 if pool.connect_calls <= pool.fail_connect_times:
                     err_cls = TRANSIENT_ERRORS[0]
                     raise err_cls("Simulated transient connection failure")
-                conn = _FakeConnection(pool.state)
+                conn = _FakeConnection(pool.state, pool=pool)
                 pool.connections.append(conn)
                 return conn
 
@@ -685,6 +831,172 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
         for leak in (secret_pw, gh_tok, sb_key, api_key, q_secret, "UrlTok123"):
             self.assertNotIn(leak, joined)
         self.assertIn("***", joined)
+
+    def test_sanitization_shared_module_nested_dicts_lists_and_receipt_payloads(self) -> None:
+        raw_nested = {
+            "idempotency_key": "safe-idem-key-1",
+            "event_key": "safe-event-key-1",
+            "changed_count": 3,
+            "headers": {
+                "Authorization": "opaque-header-secret",
+                "x-api-key": "raw-api-key-value",
+                "content-type": "application/json",
+            },
+            "credentials": {
+                "client_secret": "opaque-client-secret",
+                "tokens": ["opaque-tok-1", "opaque-tok-2"],
+            },
+            "nested_list": [
+                {"note": "ghp_1234567890123456789012345678901234 and AKIAIOSFODNN7EXAMPLE"},
+                ("postgresql://u:SecretDbPw@db.example.com:5432/app?apikey=QuerySec9", 42),
+            ],
+        }
+        cleaned = sanitize_value(raw_nested)
+        self.assertEqual(cleaned["idempotency_key"], "safe-idem-key-1")
+        self.assertEqual(cleaned["event_key"], "safe-event-key-1")
+        self.assertEqual(cleaned["changed_count"], 3)
+        self.assertEqual(cleaned["headers"]["Authorization"], "[REDACTED]")
+        self.assertEqual(cleaned["headers"]["x-api-key"], "[REDACTED]")
+        self.assertEqual(cleaned["headers"]["content-type"], "application/json")
+        self.assertEqual(cleaned["credentials"]["client_secret"], "[REDACTED]")
+        self.assertEqual(cleaned["credentials"]["tokens"], ["[REDACTED]", "[REDACTED]"])
+
+        serialized = repr(cleaned)
+        for leak in (
+            "opaque-header-secret",
+            "raw-api-key-value",
+            "opaque-client-secret",
+            "opaque-tok-1",
+            "ghp_1234567890123456789012345678901234",
+            "AKIAIOSFODNN7EXAMPLE",
+            "SecretDbPw",
+            "QuerySec9",
+        ):
+            self.assertNotIn(leak, serialized)
+
+        # Event receipt payload_summary must be sanitized before persistence
+        state = _FakeDBState()
+        state.tables_initialized = True
+        pool = _FakePool(state)
+        with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+            repo = UTDADatabaseRepository(db)
+            rec = repo.record_event_receipt(
+                delivery_id="deliv-san-1",
+                event_name="push",
+                repository="UNAI-TECH/pilot",
+                project_id="UTDA_PILOT",
+                feature_id="FEAT-SAN",
+                git_sha="abc1234",
+                payload_summary=raw_nested,
+            )
+            self.assertTrue(rec["inserted"])
+        persisted = repr(state.receipt_payloads["deliv-san-1"])
+        for leak in (
+            "opaque-header-secret",
+            "raw-api-key-value",
+            "SecretDbPw",
+            "ghp_1234567890123456789012345678901234",
+        ):
+            self.assertNotIn(leak, persisted)
+
+    def test_atomic_attempt_completion_concurrency_and_ambiguous_commit(self) -> None:
+        state = _FakeDBState()
+        state.tables_initialized = True
+        pool = _FakePool(state)
+
+        with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+            repo = UTDADatabaseRepository(db)
+            idem = "atomic-idem-key-1"
+
+            # 8 concurrent workers try to claim & allocate attempt number -> exactly 1 wins attempt #1
+            def _worker(_idx: int) -> dict:
+                return repo.claim_idempotency_and_attempt(
+                    idempotency_key=idem,
+                    scope="phase1_correlation",
+                    project_id="UTDA_PILOT",
+                    feature_id="FEAT-ATM",
+                    report_blob_sha="blob-atm",
+                    target_document_id="D06",
+                    event_receipt_id=None,
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                claims = list(ex.map(_worker, range(8)))
+            winners = [c for c in claims if c["claimed"]]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(winners[0]["attempt_number"], 1)
+            self.assertEqual(len(state.attempts), 1)
+            self.assertEqual(state.attempts[0]["status"], "IN_PROGRESS")
+
+            # Simulate worker failing between lock acquisition and completion (lock expires)
+            state.idempotency_keys[idem]["expired"] = True
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                recovery_claims = list(ex.map(_worker, range(6)))
+            rec_winners = [c for c in recovery_claims if c["claimed"]]
+            self.assertEqual(len(rec_winners), 1)
+            self.assertEqual(rec_winners[0]["attempt_number"], 2)
+            self.assertEqual(state.attempts[0]["status"], "FAILED")
+            self.assertEqual(state.attempts[0]["retry_state"], "LOCK_EXPIRED")
+            self.assertEqual([a["attempt_number"] for a in state.attempts], [1, 2])
+
+            # Mid-transaction SQL failure on idempotency_keys update rolls back attempt update too
+            state.fail_sql_substring = 'UPDATE "utda"."idempotency_keys"'
+            with self.assertRaises(RuntimeError):
+                repo.finalize_processing_attempt(
+                    event_receipt_id=None,
+                    idempotency_key=idem,
+                    attempt_number=2,
+                    attempt_status="SUCCEEDED",
+                    final_key_status="COMPLETED",
+                    result_summary={"secret_token": "must-not-leak"},
+                )
+            self.assertEqual(state.attempts[1]["status"], "IN_PROGRESS")
+            self.assertEqual(state.idempotency_keys[idem]["status"], "IN_PROGRESS")
+
+            # Clear SQL failure and finalize atomically (verifying summary sanitization too)
+            state.fail_sql_substring = None
+            repo.finalize_processing_attempt(
+                event_receipt_id=None,
+                idempotency_key=idem,
+                attempt_number=2,
+                attempt_status="SUCCEEDED",
+                final_key_status="COMPLETED",
+                result_summary={"ok": True, "api_key": "raw-secret-api-key"},
+            )
+            self.assertEqual(state.attempts[1]["status"], "SUCCEEDED")
+            self.assertEqual(state.idempotency_keys[idem]["status"], "COMPLETED")
+            self.assertNotIn("raw-secret-api-key", repr(state.idempotency_keys[idem]["result_summary"]))
+
+        # Ambiguous commit outcome: transient failure during COMMIT raises CommitOutcomeUnknownError
+        # without blindly replaying potentially committed non-idempotent transactions.
+        ambig_pool = _FakePool(state, fail_commit_times=1, commit_drops_after_apply=True)
+        with DatabaseManager(self._cfg(), pool_factory=lambda _c: ambig_pool, sleep_fn=lambda _s: None) as db:
+            calls = {"count": 0}
+
+            def _non_idempotent_op(conn) -> str:
+                calls["count"] += 1
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                return "done"
+
+            with self.assertRaises(CommitOutcomeUnknownError):
+                db.run_in_transaction(_non_idempotent_op)
+            self.assertEqual(calls["count"], 1)
+
+        # Explicitly marked idempotent operation CAN retry safely on commit drop
+        retry_commit_pool = _FakePool(state, fail_commit_times=1, commit_drops_after_apply=True)
+        with DatabaseManager(self._cfg(), pool_factory=lambda _c: retry_commit_pool, sleep_fn=lambda _s: None) as db:
+            idem_calls = {"count": 0}
+
+            def _idempotent_op(conn) -> str:
+                idem_calls["count"] += 1
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                return "ok-after-commit-retry"
+
+            res = db.run_in_transaction(_idempotent_op, retry_on_ambiguous_commit=True)
+            self.assertEqual(res, "ok-after-commit-retry")
+            self.assertEqual(idem_calls["count"], 2)
 
 
 class Phase1LivePostgreSQLTests(unittest.TestCase):
@@ -1259,6 +1571,109 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     "SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname = 'utda'"
                 )
                 self.assertEqual(cur.fetchall(), [("utda_migrator",)])
+
+    @unittest.skipUnless(
+        os.getenv("UTDA_TEST_DATABASE_URL") and os.getenv("UTDA_TEST_RUNTIME_URL"),
+        "PG16 concurrent worker & atomic transaction test requires UTDA_TEST_RUNTIME_URL (runs in ci-database.yml)",
+    )
+    def test_real_postgres_concurrent_workers_and_atomic_completion(self) -> None:
+        import psycopg
+
+        admin_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_DATABASE_URL")
+        runtime_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_RUNTIME_URL")
+        idem = "ci-pg16-concurrent-idem-1"
+        delivery = "ci-pg16-sanitized-deliv-1"
+
+        with DatabaseManager(runtime_cfg) as db:
+            repo = UTDADatabaseRepository(db)
+            repo.upsert_project(
+                project_id="CI_CONC_TEST",
+                project_name="CI Concurrent Test",
+                status="active",
+                github_owner="UNAI-TECH",
+                github_repo="ci-conc-test",
+                default_branch="main",
+            )
+            rec = repo.record_event_receipt(
+                delivery_id=delivery,
+                event_name="push",
+                repository="UNAI-TECH/ci-conc-test",
+                project_id="CI_CONC_TEST",
+                feature_id="FEAT-CONC",
+                git_sha="abc1234",
+                payload_summary={
+                    "headers": {"Authorization": "pg16-opaque-secret"},
+                    "nested": [{"note": "ghp_1234567890123456789012345678901234"}],
+                },
+            )
+            self.assertTrue(rec["inserted"])
+
+            def _claim_pg(_idx: int) -> dict:
+                return repo.claim_idempotency_and_attempt(
+                    idempotency_key=idem,
+                    scope="phase1_correlation",
+                    project_id="CI_CONC_TEST",
+                    feature_id="FEAT-CONC",
+                    report_blob_sha="blob-conc",
+                    target_document_id="D06",
+                    event_receipt_id=rec["receipt_id"],
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                first_wave = list(ex.map(_claim_pg, range(8)))
+            first_winners = [c for c in first_wave if c["claimed"]]
+            self.assertEqual(len(first_winners), 1)
+            self.assertEqual(first_winners[0]["attempt_number"], 1)
+
+            # Expire lock in DB (simulating crash between lock claim and finish) -> concurrent recovery
+            with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as aconn:
+                with aconn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE utda.idempotency_keys SET expires_at = NOW() - INTERVAL '5 minutes' WHERE idempotency_key = %s",
+                        (idem,),
+                    )
+                aconn.commit()
+
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                second_wave = list(ex.map(_claim_pg, range(6)))
+            second_winners = [c for c in second_wave if c["claimed"]]
+            self.assertEqual(len(second_winners), 1)
+            self.assertEqual(second_winners[0]["attempt_number"], 2)
+
+            # Finalize atomically with sanitized summary
+            repo.finalize_processing_attempt(
+                event_receipt_id=rec["receipt_id"],
+                idempotency_key=idem,
+                attempt_number=2,
+                attempt_status="SUCCEEDED",
+                final_key_status="COMPLETED",
+                result_summary={"access_token": "pg16-secret-tok", "status": "ok"},
+            )
+
+        with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as rconn:
+            with rconn.cursor() as cur:
+                cur.execute(
+                    "SELECT attempt_number, status, retry_state FROM utda.processing_attempts WHERE idempotency_key = %s ORDER BY attempt_number",
+                    (idem,),
+                )
+                rows = cur.fetchall()
+                self.assertEqual(rows, [(1, "FAILED", "LOCK_EXPIRED"), (2, "SUCCEEDED", "NONE")])
+
+                cur.execute(
+                    "SELECT payload_summary::text FROM utda.github_event_receipts WHERE delivery_id = %s",
+                    (delivery,),
+                )
+                payload_text = cur.fetchone()[0]
+                self.assertNotIn("pg16-opaque-secret", payload_text)
+                self.assertNotIn("ghp_1234567890123456789012345678901234", payload_text)
+
+                cur.execute(
+                    "SELECT status, result_summary::text FROM utda.idempotency_keys WHERE idempotency_key = %s",
+                    (idem,),
+                )
+                kstatus, ksummary = cur.fetchone()
+                self.assertEqual(kstatus, "COMPLETED")
+                self.assertNotIn("pg16-secret-tok", ksummary)
 
     @unittest.skipUnless(
         os.getenv("UTDA_RUN_LIVE_SUPABASE_TESTS") == "true" and os.getenv("UTDA_DATABASE_URL"),

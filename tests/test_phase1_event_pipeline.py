@@ -13,10 +13,21 @@ import unittest
 
 from engine.audit_store import AuditStore, make_idempotency_key
 from engine.config_loader import is_dry_run
-from engine.database import DatabaseManager, UTDADatabaseRepository
+from engine.database import (
+    CommitOutcomeUnknownError,
+    DatabaseManager,
+    DatabaseUnavailableError,
+    UTDADatabaseRepository,
+)
 from engine.db_config import DatabaseConfig
 from engine.db_health import verify_live_supabase_readonly
-from engine.github_reader import scrub_secrets
+from engine.github_reader import (
+    GitEvidenceError,
+    compute_blob_sha,
+    read_git_evidence,
+    scrub_secrets,
+    validate_git_sha,
+)
 from engine.migrations.runner import apply_migrations
 from engine.trigger import normalize_event, process_event
 from tests.test_database_phase1 import _FakeDBState, _FakePool
@@ -667,6 +678,308 @@ class Phase1EventPipelineTests(unittest.TestCase):
             )
             for mod in prohibited_modules:
                 self.assertNotIn(mod, sys.modules)
+
+    def test_git_evidence_commit_pinned_sha_untracked_and_failures(self) -> None:
+        from unittest.mock import patch
+
+        state = _FakeDBState()
+        state.tables_initialized = True
+        pool = _FakePool(state)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _init_temp_git_repo(base)
+            utda = _init_temp_utda_dir(base)
+
+            # Commit A: v1 report for FEAT-HIST
+            commit_a = _commit_json_report(
+                repo,
+                "FEAT-HIST",
+                {
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-HIST",
+                    "feature_name": "Historical Version",
+                    "change_type": "api_change",
+                    "summary": "Version 1 committed at commit A.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "commit-a"}],
+                },
+            )
+            blob_a = compute_blob_sha(
+                repo, "documentation/reports/final/FEAT-HIST.json", git_sha=commit_a
+            )
+            self.assertEqual(len(blob_a), 40)
+
+            # Commit B (HEAD): mutates FEAT-HIST to v2 and adds FEAT-HEADONLY
+            (repo / "documentation" / "reports" / "final" / "FEAT-HEADONLY.json").write_text(
+                json.dumps(
+                    {
+                        "project_id": "UTDA_PILOT",
+                        "feature_id": "FEAT-HEADONLY",
+                        "feature_name": "Head Only",
+                        "change_type": "other",
+                        "summary": "Only on HEAD.",
+                        "implementation_status": "implemented",
+                        "evidence": [{"kind": "commit", "reference": "commit-b"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            commit_b = _commit_json_report(
+                repo,
+                "FEAT-HIST",
+                {
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-HIST",
+                    "feature_name": "Updated HEAD Version",
+                    "change_type": "api_change",
+                    "summary": "Version 2 committed at HEAD.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "commit-b"}],
+                },
+            )
+            blob_b = compute_blob_sha(
+                repo, "documentation/reports/final/FEAT-HIST.json", git_sha=commit_b
+            )
+            self.assertNotEqual(blob_a, blob_b)
+
+            # Untracked report file on disk must NEVER appear in candidates or compute_blob_sha
+            untracked_rel = "documentation/reports/final/FEAT-UNTRACKED.json"
+            (repo / untracked_rel).write_text(
+                json.dumps(
+                    {
+                        "project_id": "UTDA_PILOT",
+                        "feature_id": "FEAT-UNTRACKED",
+                        "feature_name": "Untracked Report",
+                        "change_type": "api_change",
+                        "summary": "Should never be trusted without commit.",
+                        "implementation_status": "implemented",
+                        "evidence": [{"kind": "commit", "reference": "local"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(compute_blob_sha(repo, untracked_rel, git_sha="HEAD"), "")
+
+            # Evidences read against commit A use A's tree & blob SHA, never HEAD's
+            ev_a = read_git_evidence(
+                repo,
+                repository="UNAI-TECH/pilot-app",
+                git_sha=commit_a,
+            )
+            self.assertEqual(ev_a.report_candidates, ("documentation/reports/final/FEAT-HIST.json",))
+            self.assertEqual(
+                ev_a.report_blob_shas["documentation/reports/final/FEAT-HIST.json"], blob_a
+            )
+
+            # Commit range evidence between commit_a..commit_b covers range diffs & commits
+            ev_range = read_git_evidence(
+                repo,
+                repository="UNAI-TECH/pilot-app",
+                git_sha=commit_b,
+                base_sha=commit_a,
+            )
+            self.assertIn("documentation/reports/final/FEAT-HEADONLY.json", ev_range.changed_files)
+            self.assertEqual(ev_range.base_sha, commit_a)
+
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+                audit = AuditStore(repo=UTDADatabaseRepository(db))
+
+                # Processing untracked report returns WAITING_FOR_FINAL_REPORT (MISSING)
+                ev_untracked = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": commit_b,
+                        "PR_NUMBER": "201",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-UNTRACKED",
+                        "UTDA_DELIVERY_ID": "deliv-untracked",
+                    }
+                )
+                self.assertEqual(
+                    process_event(ev_untracked, repo_dir=repo, utda_dir=utda, audit=audit)["status"],
+                    "WAITING_FOR_FINAL_REPORT",
+                )
+
+                # Processing FEAT-HIST pinned to commit_a resolves commit_a blob SHA (not HEAD's)
+                ev_pin_a = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": commit_a,
+                        "PR_NUMBER": "202",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-HIST",
+                        "UTDA_DELIVERY_ID": "deliv-pin-a",
+                    }
+                )
+                res_a = process_event(ev_pin_a, repo_dir=repo, utda_dir=utda, audit=audit)
+                self.assertEqual(res_a["status"], "DRY_RUN_READY")
+                expected_key_a = make_idempotency_key(
+                    "UNAI-TECH/pilot-app", "FEAT-HIST", blob_a, "PHASE1_CORRELATION"
+                )
+                self.assertEqual(res_a["idempotency_key"], expected_key_a)
+
+                # Invalid SHA inputs fail closed
+                for bad_sha in ("--upload-pack=evil", "not-a-sha!", "abc", ""):
+                    with self.assertRaises(GitEvidenceError):
+                        validate_git_sha(bad_sha)
+                with self.assertRaises(GitEvidenceError):
+                    normalize_event(
+                        {
+                            "GITHUB_EVENT_NAME": "push",
+                            "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                            "GITHUB_SHA": "--evil-flag",
+                        }
+                    )
+
+                # Nonexistent commit SHA must fail explicitly, never falling back to HEAD
+                with self.assertRaises(GitEvidenceError):
+                    read_git_evidence(
+                        repo,
+                        repository="UNAI-TECH/pilot-app",
+                        git_sha="0123456789abcdef0123456789abcdef01234567",
+                    )
+
+                # Simulated diff-tree failure never falls back to ls-tree HEAD
+                with patch("engine.github_reader.subprocess.run") as mock_run:
+                    rev_ok = subprocess.CompletedProcess(
+                        args=["git"], returncode=0, stdout=f"{commit_a}\n", stderr=""
+                    )
+                    diff_fail = subprocess.CompletedProcess(
+                        args=["git"], returncode=128, stdout="", stderr="fatal: bad object"
+                    )
+                    mock_run.side_effect = [rev_ok, diff_fail]
+                    with self.assertRaises(GitEvidenceError):
+                        read_git_evidence(
+                            repo,
+                            repository="UNAI-TECH/pilot-app",
+                            git_sha=commit_a,
+                        )
+                    self.assertEqual(mock_run.call_count, 2)
+
+                # Subprocess timeout raises explicit GitEvidenceError
+                with patch(
+                    "engine.github_reader.subprocess.run",
+                    side_effect=subprocess.TimeoutExpired(cmd="git", timeout=15.0),
+                ):
+                    with self.assertRaises(GitEvidenceError):
+                        read_git_evidence(
+                            repo,
+                            repository="UNAI-TECH/pilot-app",
+                            git_sha=commit_a,
+                        )
+
+    def test_post_claim_failure_and_simulated_db_connection_outage(self) -> None:
+        state = _FakeDBState()
+        state.tables_initialized = True
+        pool = _FakePool(state)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _init_temp_git_repo(base)
+            utda = _init_temp_utda_dir(base)
+            sha = _commit_json_report(
+                repo,
+                "FEAT-REC",
+                {
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-REC",
+                    "feature_name": "Recovery Target",
+                    "change_type": "bug_fix",
+                    "summary": "Verify recovery if failure happens between claim and finish.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "rec-1"}],
+                },
+            )
+            blob = compute_blob_sha(repo, "documentation/reports/final/FEAT-REC.json", git_sha=sha)
+            idem = make_idempotency_key("UNAI-TECH/pilot-app", "FEAT-REC", blob, "PHASE1_CORRELATION")
+
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+                audit = AuditStore(repo=UTDADatabaseRepository(db))
+                # Claim succeeds (attempt 1 = IN_PROGRESS), then inject transient outage before finalize
+                orig_call = audit.record_attempt_outcome
+                called = {"n": 0}
+
+                def _fail_first_complete(**kwargs):
+                    called["n"] += 1
+                    if called["n"] == 1:
+                        raise RuntimeError("Crash before attempt finalization")
+                    return orig_call(**kwargs)
+
+                audit.record_attempt_outcome = _fail_first_complete  # type: ignore[method-assign]
+                ev1 = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": sha,
+                        "PR_NUMBER": "301",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-REC",
+                        "UTDA_DELIVERY_ID": "deliv-rec-1",
+                    }
+                )
+                with self.assertRaises(RuntimeError):
+                    process_event(ev1, repo_dir=repo, utda_dir=utda, audit=audit)
+                self.assertEqual(state.idempotency_keys[idem]["status"], "FAILED")
+                self.assertEqual(state.attempts[0]["attempt_number"], 1)
+                self.assertEqual(state.attempts[0]["status"], "FAILED")
+
+                # Retry succeeds and records attempt #2 cleanly
+                audit.record_attempt_outcome = orig_call  # type: ignore[method-assign]
+                ev2 = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": sha,
+                        "PR_NUMBER": "301",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-REC",
+                        "UTDA_DELIVERY_ID": "deliv-rec-2",
+                    }
+                )
+                res2 = process_event(ev2, repo_dir=repo, utda_dir=utda, audit=audit)
+                self.assertEqual(res2["status"], "DRY_RUN_READY")
+                self.assertEqual([a["attempt_number"] for a in state.attempts], [1, 2])
+                self.assertEqual(state.attempts[1]["status"], "SUCCEEDED")
+
+        # Simulated full DB outage fails cleanly with DatabaseUnavailableError
+        dead_pool = _FakePool(state, fail_connect_times=99)
+        with tempfile.TemporaryDirectory() as tmp2:
+            base2 = Path(tmp2)
+            repo2 = _init_temp_git_repo(base2)
+            utda2 = _init_temp_utda_dir(base2)
+            sha2 = _commit_json_report(
+                repo2,
+                "FEAT-OUT",
+                {
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-OUT",
+                    "feature_name": "Outage",
+                    "change_type": "other",
+                    "summary": "DB unavailable.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "o1"}],
+                },
+            )
+            ev_out = normalize_event(
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                    "GITHUB_SHA": sha2,
+                    "FEATURE_ID": "FEAT-OUT",
+                    "UTDA_DELIVERY_ID": "deliv-outage",
+                }
+            )
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: dead_pool, sleep_fn=lambda _s: None) as dead_db:
+                with self.assertRaises(DatabaseUnavailableError):
+                    process_event(
+                        ev_out,
+                        repo_dir=repo2,
+                        utda_dir=utda2,
+                        audit=AuditStore(repo=UTDADatabaseRepository(dead_db)),
+                    )
 
 
 if __name__ == "__main__":

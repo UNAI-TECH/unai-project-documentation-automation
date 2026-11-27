@@ -17,10 +17,13 @@ import uuid
 
 from engine.db_config import (
     DatabaseConfig,
-    configure_sanitized_logger,
     quote_ident,
-    sanitize_log_text,
     validate_identifier,
+)
+from engine.sanitization import (
+    configure_sanitized_logger,
+    sanitize_log_text,
+    sanitize_value,
 )
 
 T = TypeVar("T")
@@ -45,6 +48,10 @@ except ImportError:  # pragma: no cover - handled cleanly when driver absent
 
 class DatabaseUnavailableError(RuntimeError):
     """Raised when PostgreSQL cannot be reached after configured retries."""
+
+
+class CommitOutcomeUnknownError(RuntimeError):
+    """Raised when a connection drops during COMMIT and commit outcome is ambiguous."""
 
 
 def _utc_now_iso() -> str:
@@ -152,18 +159,30 @@ class DatabaseManager:
             yield conn
 
     @contextmanager
-    def transaction(self) -> Iterator[Any]:
+    def transaction(self, *, retry_on_ambiguous_commit: bool = False) -> Iterator[Any]:
         """Acquire a connection, apply statement timeout, commit or roll back atomically."""
         with self.connection() as conn:
             committed = False
+            in_commit = False
             try:
                 with conn.cursor() as cur:
                     cur.execute(
                         f"SET LOCAL statement_timeout = {int(self.config.statement_timeout_ms)}"
                     )
                 yield conn
+                in_commit = True
                 conn.commit()
                 committed = True
+            except TRANSIENT_ERRORS as exc:
+                if in_commit and not retry_on_ambiguous_commit:
+                    self.logger.error(
+                        "Ambiguous commit outcome after transient error: %s",
+                        sanitize_log_text(str(exc)),
+                    )
+                    raise CommitOutcomeUnknownError(
+                        "Database connection failed during commit; outcome is ambiguous and was not retried."
+                    ) from exc
+                raise
             finally:
                 if not committed:
                     try:
@@ -174,10 +193,15 @@ class DatabaseManager:
                             sanitize_log_text(str(rb_err)),
                         )
 
-    def run_in_transaction(self, fn: Callable[[Any], T]) -> T:
+    def run_in_transaction(
+        self,
+        fn: Callable[[Any], T],
+        *,
+        retry_on_ambiguous_commit: bool = False,
+    ) -> T:
         """Run a transactional callback with transient connection retry safety."""
         def _attempt() -> T:
-            with self.transaction() as conn:
+            with self.transaction(retry_on_ambiguous_commit=retry_on_ambiguous_commit) as conn:
                 return fn(conn)
 
         return self.execute_with_retry(_attempt)
@@ -224,7 +248,7 @@ class UTDADatabaseRepository:
                 registry_metadata = EXCLUDED.registry_metadata,
                 updated_at = NOW()
         """
-        payload = json.dumps(registry_metadata or {})
+        payload = json.dumps(sanitize_value(registry_metadata or {}))
         def _op(conn: Any) -> None:
             with conn.cursor() as cur:
                 cur.execute(
@@ -241,7 +265,7 @@ class UTDADatabaseRepository:
                         payload,
                     ),
                 )
-        self.db.run_in_transaction(_op)
+        self.db.run_in_transaction(_op, retry_on_ambiguous_commit=True)
 
     def record_event_receipt(
         self,
@@ -256,7 +280,7 @@ class UTDADatabaseRepository:
         report_blob_sha: str | None = None,
         payload_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Persist a GitHub event receipt idempotently by delivery_id."""
+        """Persist a GitHub event receipt idempotently by delivery_id with sanitized summary."""
         receipt_id = str(uuid.uuid4())
         sql = f"""
             INSERT INTO {self._tbl('github_event_receipts')} (
@@ -267,7 +291,7 @@ class UTDADatabaseRepository:
             ON CONFLICT (delivery_id) DO NOTHING
             RETURNING receipt_id
         """
-        summary_json = json.dumps(payload_summary or {})
+        summary_json = json.dumps(sanitize_value(payload_summary or {}))
 
         def _op(conn: Any) -> dict[str, Any]:
             with conn.cursor() as cur:
@@ -470,6 +494,96 @@ class UTDADatabaseRepository:
 
         return self.db.run_in_transaction(_op)
 
+    def claim_idempotency_and_attempt(
+        self,
+        *,
+        idempotency_key: str,
+        scope: str,
+        project_id: str,
+        feature_id: str,
+        report_blob_sha: str,
+        target_document_id: str,
+        event_receipt_id: str | None,
+        lock_ttl_seconds: int = 900,
+    ) -> dict[str, Any]:
+        """Atomically claim idempotency lock, retire stale attempts, and allocate attempt_number."""
+        keys_tbl = self._tbl("idempotency_keys")
+        attempts_tbl = self._tbl("processing_attempts")
+        acquire_sql = f"""
+            INSERT INTO {keys_tbl} (
+                idempotency_key, scope, project_id, feature_id,
+                report_blob_sha, target_document_id, status, locked_at, expires_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, 'IN_PROGRESS',
+                NOW(),
+                NOW() + (%s::integer * INTERVAL '1 second')
+            )
+            ON CONFLICT (idempotency_key) DO UPDATE SET
+                status = 'IN_PROGRESS',
+                locked_at = NOW(),
+                expires_at = NOW() + (%s::integer * INTERVAL '1 second')
+            WHERE {keys_tbl}.status = 'FAILED'
+               OR (
+                   {keys_tbl}.status = 'IN_PROGRESS'
+                   AND {keys_tbl}.expires_at IS NOT NULL
+                   AND {keys_tbl}.expires_at < NOW()
+               )
+            RETURNING idempotency_key
+        """
+        retire_sql = f"""
+            UPDATE {attempts_tbl}
+            SET status = 'FAILED',
+                retry_state = 'LOCK_EXPIRED',
+                error_code = COALESCE(error_code, 'LOCK_EXPIRED'),
+                error_summary = COALESCE(error_summary, 'Abandoned prior IN_PROGRESS attempt expired.'),
+                finished_at = NOW()
+            WHERE idempotency_key = %s
+              AND status = 'IN_PROGRESS'
+        """
+        alloc_sql = f"""
+            INSERT INTO {attempts_tbl} (
+                attempt_id, event_receipt_id, idempotency_key, attempt_number,
+                status, retry_state, started_at
+            )
+            SELECT
+                %s, %s, %s, COALESCE(MAX(attempt_number), 0) + 1,
+                'IN_PROGRESS', 'NONE', NOW()
+            FROM {attempts_tbl}
+            WHERE idempotency_key = %s
+            RETURNING attempt_id, attempt_number
+        """
+        attempt_id = str(uuid.uuid4())
+
+        def _op(conn: Any) -> dict[str, Any]:
+            with conn.cursor() as cur:
+                cur.execute(
+                    acquire_sql,
+                    (
+                        idempotency_key,
+                        scope,
+                        project_id,
+                        feature_id,
+                        report_blob_sha,
+                        target_document_id,
+                        lock_ttl_seconds,
+                        lock_ttl_seconds,
+                    ),
+                )
+                if cur.fetchone() is None:
+                    return {"claimed": False, "attempt_number": 0, "attempt_id": None}
+                # Holding the row lock on idempotency_keys serializes attempt numbering per key.
+                cur.execute(retire_sql, (idempotency_key,))
+                cur.execute(alloc_sql, (attempt_id, event_receipt_id, idempotency_key, idempotency_key))
+                row = cur.fetchone()
+                return {
+                    "claimed": True,
+                    "attempt_id": row[0] if row else attempt_id,
+                    "attempt_number": int(row[1]) if row else 1,
+                }
+
+        return self.db.run_in_transaction(_op)
+
     def complete_idempotency_key(
         self,
         *,
@@ -484,13 +598,105 @@ class UTDADatabaseRepository:
                 result_summary = %s::jsonb
             WHERE idempotency_key = %s
         """
-        summary_json = json.dumps(result_summary or {})
+        summary_json = json.dumps(sanitize_value(result_summary or {}))
 
         def _op(conn: Any) -> None:
             with conn.cursor() as cur:
                 cur.execute(sql, (status, summary_json, idempotency_key))
 
         self.db.run_in_transaction(_op)
+
+    def finalize_processing_attempt(
+        self,
+        *,
+        event_receipt_id: str | None,
+        idempotency_key: str,
+        attempt_number: int,
+        attempt_status: str,
+        final_key_status: str,
+        retry_state: str = "NONE",
+        error_code: str | None = None,
+        error_summary: str | None = None,
+        result_summary: dict[str, Any] | None = None,
+    ) -> str:
+        """Atomically record processing attempt completion and update idempotency key state."""
+        attempts_tbl = self._tbl("processing_attempts")
+        keys_tbl = self._tbl("idempotency_keys")
+        update_attempt_sql = f"""
+            UPDATE {attempts_tbl}
+            SET status = %s,
+                retry_state = %s,
+                error_code = %s,
+                error_summary = %s,
+                finished_at = NOW()
+            WHERE idempotency_key = %s
+              AND attempt_number = %s
+            RETURNING attempt_id
+        """
+        insert_attempt_sql = f"""
+            INSERT INTO {attempts_tbl} (
+                attempt_id, event_receipt_id, idempotency_key, attempt_number,
+                status, retry_state, error_code, error_summary, started_at, finished_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            RETURNING attempt_id
+        """
+        complete_key_sql = f"""
+            UPDATE {keys_tbl}
+            SET status = %s,
+                completed_at = NOW(),
+                result_summary = %s::jsonb
+            WHERE idempotency_key = %s
+            RETURNING idempotency_key
+        """
+        safe_error = sanitize_log_text(error_summary) if error_summary else None
+        summary_json = json.dumps(sanitize_value(result_summary or {}))
+        fallback_attempt_id = str(uuid.uuid4())
+
+        def _op(conn: Any) -> str:
+            with conn.cursor() as cur:
+                cur.execute(
+                    update_attempt_sql,
+                    (
+                        attempt_status,
+                        retry_state,
+                        error_code,
+                        safe_error,
+                        idempotency_key,
+                        attempt_number,
+                    ),
+                )
+                att_row = cur.fetchone()
+                if att_row is None:
+                    cur.execute(
+                        insert_attempt_sql,
+                        (
+                            fallback_attempt_id,
+                            event_receipt_id,
+                            idempotency_key,
+                            attempt_number,
+                            attempt_status,
+                            retry_state,
+                            error_code,
+                            safe_error,
+                        ),
+                    )
+                    ins_row = cur.fetchone()
+                    resolved_attempt_id = ins_row[0] if ins_row else fallback_attempt_id
+                else:
+                    resolved_attempt_id = att_row[0]
+
+                cur.execute(
+                    complete_key_sql,
+                    (final_key_status, summary_json, idempotency_key),
+                )
+                if cur.fetchone() is None:
+                    raise RuntimeError(
+                        f"Idempotency key '{idempotency_key}' was missing during atomic completion."
+                    )
+                return resolved_attempt_id
+
+        return self.db.run_in_transaction(_op)
 
     def record_processing_attempt(
         self,
@@ -558,8 +764,9 @@ class UTDADatabaseRepository:
             ON CONFLICT (project_id, feature_id, report_blob_sha) DO NOTHING
             RETURNING report_id
         """
-        meta_json = sanitize_log_text(json.dumps(report_metadata))
-        ev_json = sanitize_log_text(json.dumps(evidence_refs))
+        safe_feature_name = sanitize_log_text(feature_name)
+        meta_json = json.dumps(sanitize_value(report_metadata))
+        ev_json = json.dumps(sanitize_value(evidence_refs))
 
         def _op(conn: Any) -> dict[str, Any]:
             with conn.cursor() as cur:
@@ -569,7 +776,7 @@ class UTDADatabaseRepository:
                         report_id,
                         project_id,
                         feature_id,
-                        feature_name,
+                        safe_feature_name,
                         change_type,
                         implementation_status,
                         report_path,
@@ -606,7 +813,7 @@ class UTDADatabaseRepository:
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
         """
-        safe_details = sanitize_log_text(json.dumps(details or {}))
+        safe_details = json.dumps(sanitize_value(details or {}))
 
         def _op(conn: Any) -> str:
             with conn.cursor() as cur:

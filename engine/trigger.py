@@ -24,8 +24,14 @@ from engine.config_loader import (
 from engine.contracts import AUTHORITY_MODE, MASTER_RECORD_SCOPE
 from engine.database import DatabaseManager, UTDADatabaseRepository
 from engine.db_config import DatabaseConfig, DatabaseConfigError
-from engine.github_reader import read_git_evidence
+from engine.github_reader import (
+    GitEvidenceError,
+    read_git_blob_text,
+    read_git_evidence,
+    validate_git_sha,
+)
 from engine.report_parser import locate_and_parse_report
+from engine.sanitization import sanitize_log_text
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,7 @@ class NormalizedEvent:
     project_id: str | None
     report_dir: str
     dry_run: bool
+    base_sha: str | None = None
 
 
 def _read_github_event_payload(env: Mapping[str, str]) -> dict[str, Any]:
@@ -65,9 +72,21 @@ def normalize_event(environ: Mapping[str, str] | None = None) -> NormalizedEvent
         env.get("GITHUB_REPOSITORY", "").strip()
         or payload.get("repository", {}).get("full_name", "")
     )
-    git_sha = env.get("GITHUB_SHA", "").strip() or "HEAD"
+    git_sha = validate_git_sha(
+        env.get("GITHUB_SHA", "").strip() or "HEAD",
+        field_name="GITHUB_SHA",
+    )
 
     pr_obj = payload.get("pull_request", {})
+    raw_base = (
+        env.get("UTDA_BASE_SHA", "").strip()
+        or str(pr_obj.get("base", {}).get("sha") or "").strip()
+        or str(payload.get("before") or "").strip()
+    )
+    base_sha: str | None = None
+    if raw_base and not re.fullmatch(r"0{40,64}", raw_base):
+        base_sha = validate_git_sha(raw_base, allow_head=False, field_name="base_sha")
+
     raw_pr = env.get("PR_NUMBER", "").strip() or str(pr_obj.get("number") or "").strip()
     pr_number = int(raw_pr) if raw_pr.isdigit() else None
 
@@ -112,6 +131,7 @@ def normalize_event(environ: Mapping[str, str] | None = None) -> NormalizedEvent
         project_id=project_id,
         report_dir=report_dir,
         dry_run=is_dry_run(env),
+        base_sha=base_sha,
     )
 
 
@@ -151,6 +171,7 @@ def process_event(
         repo_dir,
         repository=event.repository,
         git_sha=event.git_sha,
+        base_sha=event.base_sha,
         pr_number=event.pr_number,
         report_dir=event.report_dir,
     )
@@ -161,6 +182,8 @@ def process_event(
         feature_id=event.feature_id,
         expected_project_id=project_id,
         changed_files=evidence.changed_files,
+        report_candidates=evidence.report_candidates,
+        blob_reader=lambda rel: read_git_blob_text(repo_dir, rel, git_sha=evidence.git_sha),
     )
 
     feature_id = (
@@ -180,10 +203,14 @@ def process_event(
         repository=event.repository,
         project_id=project_id,
         feature_id=feature_id,
-        git_sha=event.git_sha,
+        git_sha=evidence.git_sha,
         pr_number=event.pr_number,
         report_blob_sha=report_blob_sha or None,
-        payload_summary={"dry_run": True, "changed_count": len(evidence.changed_files)},
+        payload_summary={
+            "dry_run": True,
+            "changed_count": len(evidence.changed_files),
+            "base_sha": evidence.base_sha,
+        },
     )
     if not receipt["inserted"]:
         result = {
@@ -201,7 +228,7 @@ def process_event(
             project_id=project_id,
             feature_id=feature_id,
             pr_number=event.pr_number,
-            pr_merged_sha=event.git_sha if event.event_name == "pull_request" else None,
+            pr_merged_sha=evidence.git_sha if event.event_name == "pull_request" else None,
             force_status="WAITING_FOR_FINAL_REPORT",
         )
         audit.append_audit(
@@ -225,7 +252,7 @@ def process_event(
             project_id=project_id,
             feature_id=feature_id,
             pr_number=event.pr_number,
-            pr_merged_sha=event.git_sha if event.event_name == "pull_request" else None,
+            pr_merged_sha=evidence.git_sha if event.event_name == "pull_request" else None,
             force_status="VALIDATION_FAILED",
         )
         audit.append_audit(
@@ -251,11 +278,11 @@ def process_event(
         report=parsed.report,
         report_path=parsed.report_path,
         report_blob_sha=report_blob_sha or "local-sha",
-        git_commit_sha=event.git_sha,
+        git_commit_sha=evidence.git_sha,
     )
 
     pr_merged_sha = (
-        event.git_sha
+        evidence.git_sha
         if event.event_name in ("pull_request", "workflow_dispatch")
         else None
     )
@@ -310,14 +337,33 @@ def process_event(
         audit.export_artifact("audit_record.json", result)
         return result
 
-    audit.record_attempt_outcome(
-        event_receipt_id=receipt["receipt_id"],
-        idempotency_key=idem_key,
-        attempt_number=attempt_no,
-        succeeded=True,
-        final_key_status="COMPLETED",
-        result_summary={"phase": 1, "dry_run": True, "report_path": parsed.report_path},
-    )
+    finalized = False
+    try:
+        audit.record_attempt_outcome(
+            event_receipt_id=receipt["receipt_id"],
+            idempotency_key=idem_key,
+            attempt_number=attempt_no,
+            succeeded=True,
+            final_key_status="COMPLETED",
+            result_summary={"phase": 1, "dry_run": True, "report_path": parsed.report_path},
+        )
+        finalized = True
+    except Exception as exc:
+        if not finalized:
+            try:
+                audit.record_attempt_outcome(
+                    event_receipt_id=receipt["receipt_id"],
+                    idempotency_key=idem_key,
+                    attempt_number=attempt_no,
+                    succeeded=False,
+                    final_key_status="FAILED",
+                    retry_state="RETRY_SCHEDULED",
+                    error_code=type(exc).__name__,
+                    error_summary=str(exc),
+                )
+            except Exception:
+                pass
+        raise
     audit.append_audit(
         actor="utda.trigger",
         event_type="PHASE1_CORRELATED_DRY_RUN",
@@ -345,7 +391,11 @@ def main() -> int:
     utda_dir = Path(__file__).resolve().parent.parent
     repo_dir = Path(os.getenv("UTDA_REPO_DIR", str(utda_dir)))
     artifacts_dir = utda_dir / "artifacts"
-    event = normalize_event()
+    try:
+        event = normalize_event()
+    except GitEvidenceError as exc:
+        print(f"Git evidence error: {sanitize_log_text(str(exc))}", file=sys.stderr)
+        return 2
 
     db_manager: DatabaseManager | None = None
     db_repo: UTDADatabaseRepository | None = None
@@ -356,7 +406,7 @@ def main() -> int:
             db_manager.open()
             db_repo = UTDADatabaseRepository(db_manager)
         except DatabaseConfigError as exc:
-            print(f"Database config error: {exc}", file=sys.stderr)
+            print(f"Database config error: {sanitize_log_text(str(exc))}", file=sys.stderr)
             return 2
 
     try:
@@ -366,8 +416,8 @@ def main() -> int:
         )
         print(json.dumps(result, indent=2))
         return 1 if result["status"] == "VALIDATION_FAILED" else 0
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
+    except (ConfigError, GitEvidenceError) as exc:
+        print(f"Configuration/Git error: {sanitize_log_text(str(exc))}", file=sys.stderr)
         return 2
     finally:
         if db_manager is not None:

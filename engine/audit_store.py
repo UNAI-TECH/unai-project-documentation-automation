@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from engine.database import UTDADatabaseRepository
-from engine.github_reader import scrub_secrets
+from engine.sanitization import sanitize_value, scrub_secrets
 
 
 def make_event_key(repository: str, feature_id: str, report_blob_sha: str) -> str:
@@ -25,16 +25,6 @@ def make_idempotency_key(
     """Compute deterministic per-document idempotency key."""
     raw = f"{repository}:{feature_id}:{report_blob_sha}:{target_document_id}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _scrub_value(value: Any) -> Any:
-    if isinstance(value, str):
-        return scrub_secrets(value)
-    if isinstance(value, list):
-        return [_scrub_value(item) for item in value]
-    if isinstance(value, dict):
-        return {k: _scrub_value(v) for k, v in value.items()}
-    return value
 
 
 class AuditStore:
@@ -81,6 +71,7 @@ class AuditStore:
         report_blob_sha: str | None,
         payload_summary: dict[str, Any],
     ) -> dict[str, Any]:
+        safe_summary = sanitize_value(payload_summary)
         if not self.repo:
             return {"inserted": True, "receipt_id": f"local-{delivery_id}", "delivery_id": delivery_id}
         return self.repo.record_event_receipt(
@@ -92,7 +83,7 @@ class AuditStore:
             git_sha=git_sha,
             pr_number=pr_number,
             report_blob_sha=report_blob_sha,
-            payload_summary=payload_summary,
+            payload_summary=safe_summary,
         )
 
     def correlate_feature(
@@ -147,7 +138,7 @@ class AuditStore:
             report_blob_sha=report_blob_sha,
             git_commit_sha=git_commit_sha,
             report_metadata={"summary": scrub_secrets(report.get("summary", ""))},
-            evidence_refs=_scrub_value(report.get("evidence", [])),
+            evidence_refs=sanitize_value(report.get("evidence", [])),
         )
 
     def claim_processing_lock(
@@ -160,21 +151,21 @@ class AuditStore:
         report_blob_sha: str,
         target_document_id: str,
         event_receipt_id: str | None,
+        lock_ttl_seconds: int = 900,
     ) -> tuple[bool, int]:
         if not self.repo:
             return True, 1
-        claimed = self.repo.acquire_idempotency_key(
+        claimed = self.repo.claim_idempotency_and_attempt(
             idempotency_key=idempotency_key,
             scope=scope,
             project_id=project_id,
             feature_id=feature_id,
             report_blob_sha=report_blob_sha,
             target_document_id=target_document_id,
+            event_receipt_id=event_receipt_id,
+            lock_ttl_seconds=lock_ttl_seconds,
         )
-        if not claimed:
-            return False, 0
-        attempt_no = self.repo.next_attempt_number(idempotency_key=idempotency_key)
-        return True, attempt_no
+        return bool(claimed["claimed"]), int(claimed["attempt_number"])
 
     def record_attempt_outcome(
         self,
@@ -191,19 +182,16 @@ class AuditStore:
     ) -> None:
         if not self.repo:
             return
-        self.repo.record_processing_attempt(
+        self.repo.finalize_processing_attempt(
             event_receipt_id=event_receipt_id,
             idempotency_key=idempotency_key,
             attempt_number=attempt_number,
-            status="SUCCEEDED" if succeeded else "FAILED",
+            attempt_status="SUCCEEDED" if succeeded else "FAILED",
+            final_key_status=final_key_status,
             retry_state=retry_state,
             error_code=error_code,
             error_summary=scrub_secrets(error_summary) if error_summary else None,
-        )
-        self.repo.complete_idempotency_key(
-            idempotency_key=idempotency_key,
-            status=final_key_status,
-            result_summary=_scrub_value(result_summary) if result_summary else None,
+            result_summary=sanitize_value(result_summary) if result_summary else None,
         )
 
     def append_audit(
@@ -225,7 +213,7 @@ class AuditStore:
                 feature_id=feature_id,
                 document_id=document_id,
                 idempotency_key=idempotency_key,
-                details=_scrub_value(details) if details else None,
+                details=sanitize_value(details) if details else None,
             )
 
     def export_artifact(self, filename: str, payload: dict[str, Any]) -> Path | None:
@@ -233,6 +221,7 @@ class AuditStore:
             return None
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         out = self.artifacts_dir / filename
-        safe_text = scrub_secrets(json.dumps(payload, indent=2, sort_keys=True))
+        safe_payload = sanitize_value(payload)
+        safe_text = scrub_secrets(json.dumps(safe_payload, indent=2, sort_keys=True))
         out.write_text(safe_text + "\n", encoding="utf-8")
         return out

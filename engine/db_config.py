@@ -7,38 +7,35 @@ redacts credentials, tokens, API keys, and sensitive query params from logs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import logging
 import os
 import re
-from typing import Mapping
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from typing import Any, Mapping
+from urllib.parse import parse_qsl, urlparse
+
+from engine.sanitization import (
+    API_KEY_RE,
+    AWS_KEY_RE,
+    BEARER_TOKEN_RE,
+    DSN_LOG_RE,
+    GITHUB_TOKEN_RE,
+    JWT_RE,
+    KV_SECRET_RE,
+    PRIVATE_KEY_RE,
+    SENSITIVE_QUERY_KEYS,
+    SUPABASE_KEY_RE,
+    SanitizingFilter,
+    configure_sanitized_logger,
+    redact_dsn,
+    sanitize_log_text,
+    sanitize_value,
+    scrub_secrets,
+)
 
 VALID_POOL_MODES = ("session", "transaction", "direct")
 SECURE_SSL_MODES = ("require", "verify-ca", "verify-full")
 LOCAL_INSECURE_SSL_MODES = ("disable", "allow", "prefer")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 SCHEMA_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
-SENSITIVE_QUERY_KEYS = frozenset(
-    {"password", "pass", "pwd", "apikey", "api_key", "token", "secret", "access_token", "jwt"}
-)
-
-DSN_LOG_RE = re.compile(r"(postgres(?:ql)?://[^:\s/@]+:)([^@\s]+)(@)", re.IGNORECASE)
-URI_QUERY_SECRET_RE = re.compile(
-    r"([?&](?:password|pass|pwd|apikey|api_key|token|secret|access_token|jwt)=)([^&\s'\"]+)",
-    re.IGNORECASE,
-)
-KV_SECRET_RE = re.compile(
-    r"((?:password|pass|pwd|apikey|api_key|token|secret|access_token)\s*=\s*)([^\s;'\"]+)",
-    re.IGNORECASE,
-)
-PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
-)
-GITHUB_TOKEN_RE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
-SUPABASE_KEY_RE = re.compile(r"\b(sb_(?:publishable|secret)_[A-Za-z0-9_-]{12,})\b")
-API_KEY_RE = re.compile(r"\b(sk-(?:or-v1-)?[A-Za-z0-9_-]{16,})\b")
-BEARER_TOKEN_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9\-._~+/]+=*")
-JWT_RE = re.compile(r"\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b")
 
 
 class DatabaseConfigError(ValueError):
@@ -58,81 +55,6 @@ def quote_ident(name: str, kind: str = "identifier") -> str:
     """Validate and double-quote a PostgreSQL identifier."""
     safe = validate_identifier(name, kind=kind)
     return f'"{safe}"'
-
-
-def redact_dsn(dsn: str) -> str:
-    """Return a PostgreSQL DSN with password and sensitive query params masked."""
-    if not dsn:
-        return "<empty>"
-    try:
-        parsed = urlparse(dsn)
-    except ValueError:
-        return "<redacted-invalid-dsn>"
-
-    if not parsed.scheme:
-        return "<redacted-non-uri>"
-
-    netloc = parsed.netloc
-    if "@" in netloc:
-        userinfo, hostpart = netloc.rsplit("@", 1)
-        if ":" in userinfo:
-            user, _ = userinfo.split(":", 1)
-            netloc = f"{user}:***@{hostpart}"
-        else:
-            netloc = f"***@{hostpart}"
-
-    query_items = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in SENSITIVE_QUERY_KEYS:
-            query_items.append((key, "***"))
-        else:
-            query_items.append((key, value))
-
-    return urlunparse(
-        (
-            parsed.scheme,
-            netloc,
-            parsed.path,
-            parsed.params,
-            urlencode(query_items),
-            "",
-        )
-    )
-
-
-def sanitize_log_text(text: str) -> str:
-    """Scrub DSN passwords, query secrets, GitHub tokens, Supabase keys, and API keys."""
-    scrubbed = PRIVATE_KEY_RE.sub("[REDACTED_PRIVATE_KEY]", text)
-    scrubbed = DSN_LOG_RE.sub(r"\1***\3", scrubbed)
-    scrubbed = URI_QUERY_SECRET_RE.sub(r"\1***", scrubbed)
-    scrubbed = GITHUB_TOKEN_RE.sub("[REDACTED_GITHUB_TOKEN]", scrubbed)
-    scrubbed = SUPABASE_KEY_RE.sub("[REDACTED_SUPABASE_KEY]", scrubbed)
-    scrubbed = API_KEY_RE.sub("[REDACTED_API_KEY]", scrubbed)
-    scrubbed = BEARER_TOKEN_RE.sub(r"\1[REDACTED_TOKEN]", scrubbed)
-    scrubbed = JWT_RE.sub("[REDACTED_JWT]", scrubbed)
-    scrubbed = KV_SECRET_RE.sub(r"\1***", scrubbed)
-    return scrubbed
-
-
-class SanitizingFilter(logging.Filter):
-    """Logging filter that redacts database credentials and tokens before emission."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            rendered = record.getMessage()
-        except Exception:
-            rendered = str(record.msg)
-        record.msg = sanitize_log_text(rendered)
-        record.args = ()
-        return True
-
-
-def configure_sanitized_logger(name: str = "utda.database") -> logging.Logger:
-    """Return a logger guarded by SanitizingFilter."""
-    logger = logging.getLogger(name)
-    if not any(isinstance(f, SanitizingFilter) for f in logger.filters):
-        logger.addFilter(SanitizingFilter())
-    return logger
 
 
 def _parse_int(raw: str | None, default: int, name: str, minimum: int, maximum: int) -> int:
