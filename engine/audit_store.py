@@ -152,9 +152,9 @@ class AuditStore:
         target_document_id: str,
         event_receipt_id: str | None,
         lock_ttl_seconds: int = 900,
-    ) -> tuple[bool, int]:
+    ) -> tuple[bool, int, str | None]:
         if not self.repo:
-            return True, 1
+            return True, 1, f"local-{idempotency_key}"
         claimed = self.repo.claim_idempotency_and_attempt(
             idempotency_key=idempotency_key,
             scope=scope,
@@ -165,14 +165,15 @@ class AuditStore:
             event_receipt_id=event_receipt_id,
             lock_ttl_seconds=lock_ttl_seconds,
         )
-        return bool(claimed["claimed"]), int(claimed["attempt_number"])
+        return bool(claimed["claimed"]), int(claimed["attempt_number"]), claimed.get("attempt_id")
 
     def record_attempt_outcome(
         self,
         *,
         event_receipt_id: str | None,
         idempotency_key: str,
-        attempt_number: int,
+        attempt_id: str,
+        attempt_number: int | None = None,
         succeeded: bool,
         final_key_status: str,
         retry_state: str = "NONE",
@@ -185,6 +186,7 @@ class AuditStore:
         self.repo.finalize_processing_attempt(
             event_receipt_id=event_receipt_id,
             idempotency_key=idempotency_key,
+            attempt_id=attempt_id,
             attempt_number=attempt_number,
             attempt_status="SUCCEEDED" if succeeded else "FAILED",
             final_key_status=final_key_status,

@@ -343,7 +343,7 @@ class Phase1EventPipelineTests(unittest.TestCase):
             audit = AuditStore(repo=UTDADatabaseRepository(db))
             idem = make_idempotency_key("UNAI-TECH/pilot-app", "FEAT-303", "blob303", "D06")
 
-            claimed1, att1 = audit.claim_processing_lock(
+            claimed1, att1, att1_id = audit.claim_processing_lock(
                 idempotency_key=idem,
                 scope="phase1_correlation",
                 project_id="UTDA_PILOT",
@@ -354,11 +354,13 @@ class Phase1EventPipelineTests(unittest.TestCase):
             )
             self.assertTrue(claimed1)
             self.assertEqual(att1, 1)
+            self.assertIsNotNone(att1_id)
 
             # Simulate transient failure marking key FAILED
             audit.record_attempt_outcome(
                 event_receipt_id=None,
                 idempotency_key=idem,
+                attempt_id=str(att1_id),
                 attempt_number=att1,
                 succeeded=False,
                 final_key_status="FAILED",
@@ -368,7 +370,7 @@ class Phase1EventPipelineTests(unittest.TestCase):
             )
 
             # Recovery re-acquires lock and increments attempt_number to 2
-            claimed2, att2 = audit.claim_processing_lock(
+            claimed2, att2, att2_id = audit.claim_processing_lock(
                 idempotency_key=idem,
                 scope="phase1_correlation",
                 project_id="UTDA_PILOT",
@@ -379,6 +381,7 @@ class Phase1EventPipelineTests(unittest.TestCase):
             )
             self.assertTrue(claimed2)
             self.assertEqual(att2, 2)
+            self.assertNotEqual(att2_id, att1_id)
 
         # Read-only Supabase verification returns pending when env unset
         prev = os.environ.pop("UTDA_DATABASE_URL", None)
@@ -461,7 +464,14 @@ class Phase1EventPipelineTests(unittest.TestCase):
                         )
                         self.assertGreaterEqual(cur.fetchone()[0], 2)
 
-                        # Verify expired stale IN_PROGRESS lock can be recovered
+                        # Simulate expired stale IN_PROGRESS lock and check matching immutable identity
+                        cur.execute(
+                            """
+                            SELECT report_blob_sha FROM utda.idempotency_keys WHERE idempotency_key = %s
+                            """,
+                            (done["idempotency_key"],),
+                        )
+                        actual_blob_sha = cur.fetchone()[0]
                         cur.execute(
                             """
                             UPDATE utda.idempotency_keys
@@ -471,15 +481,18 @@ class Phase1EventPipelineTests(unittest.TestCase):
                             """,
                             (done["idempotency_key"],),
                         )
-                recovered = audit.repo.acquire_idempotency_key(
+                recovered = audit.repo.claim_idempotency_and_attempt(
                     idempotency_key=done["idempotency_key"],
                     scope="phase1_correlation",
                     project_id="UTDA_PILOT",
                     feature_id="FEAT-PG-501",
-                    report_blob_sha="sha-pg",
+                    report_blob_sha=actual_blob_sha,
                     target_document_id="PHASE1_CORRELATION",
+                    event_receipt_id=None,
                 )
-                self.assertTrue(recovered)
+                self.assertTrue(recovered["claimed"])
+                self.assertTrue(recovered["attempt_id"])
+                self.assertEqual(recovered["attempt_number"], 2)
 
     def test_github_event_parsing_from_webhook_payload_and_branch_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -316,7 +316,7 @@ def process_event(
     idem_key = make_idempotency_key(
         event.repository, feature_id, report_blob_sha or "local-sha", "PHASE1_CORRELATION"
     )
-    claimed, attempt_no = audit.claim_processing_lock(
+    claimed, attempt_no, attempt_id = audit.claim_processing_lock(
         idempotency_key=idem_key,
         scope="phase1_correlation",
         project_id=project_id,
@@ -325,7 +325,7 @@ def process_event(
         target_document_id="PHASE1_CORRELATION",
         event_receipt_id=receipt["receipt_id"],
     )
-    if not claimed:
+    if not claimed or not attempt_id:
         result = {
             "status": "SKIPPED_DUPLICATE",
             "project_id": project_id,
@@ -342,6 +342,7 @@ def process_event(
         audit.record_attempt_outcome(
             event_receipt_id=receipt["receipt_id"],
             idempotency_key=idem_key,
+            attempt_id=attempt_id,
             attempt_number=attempt_no,
             succeeded=True,
             final_key_status="COMPLETED",
@@ -354,6 +355,7 @@ def process_event(
                 audit.record_attempt_outcome(
                     event_receipt_id=receipt["receipt_id"],
                     idempotency_key=idem_key,
+                    attempt_id=attempt_id,
                     attempt_number=attempt_no,
                     succeeded=False,
                     final_key_status="FAILED",

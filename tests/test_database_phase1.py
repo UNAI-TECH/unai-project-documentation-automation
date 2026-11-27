@@ -17,6 +17,8 @@ from engine.database import (
     CommitOutcomeUnknownError,
     DatabaseManager,
     DatabaseUnavailableError,
+    IdempotencyIdentityMismatchError,
+    StaleAttemptError,
     UTDADatabaseRepository,
 )
 from engine.db_config import (
@@ -52,11 +54,11 @@ class _FakeDBState:
         self.current_user = current_user
         self.tables_initialized = False
         self.migrations: dict[str, tuple[str, str]] = {}
-        self.projects: dict[str, dict] = {}
+        self.projects: dict[str, tuple] = {}
         self.receipts_by_delivery: dict[str, str] = {}
         self.receipt_payloads: dict[str, dict] = {}
         self.feature_states: dict[tuple[str, str], dict] = {}
-        self.final_reports: set[tuple[str, str, str]] = set()
+        self.final_reports: dict[tuple[str, str, str], str] = {}
         self.idempotency_keys: dict[str, dict] = {}
         self.attempts: list[dict] = []
         self.audit_events: list[tuple] = []
@@ -123,7 +125,14 @@ class _FakeCursor:
             self.conn.pending_ops.append(("migration", (version, checksum)))
             return
         if "INSERT INTO" in norm and ".projects" in norm:
-            self.conn.pending_ops.append(("project", params[0]))
+            self.conn.pending_ops.append(("project", params))
+            return
+        if "SELECT project_name, status, github_owner" in norm and ".projects" in norm:
+            pid = params[0]
+            with state.lock:
+                proj = state.projects.get(pid)
+                if proj:
+                    self._rows = [proj]
             return
         if "INSERT INTO" in norm and ".github_event_receipts" in norm:
             import json as _json
@@ -138,6 +147,13 @@ class _FakeCursor:
                     state.receipts_by_delivery[delivery_id] = receipt_id
                     state.receipt_payloads[delivery_id] = payload_summary
                     self._rows = [(receipt_id,)]
+            return
+        if "SELECT receipt_id FROM" in norm and ".github_event_receipts" in norm:
+            did = params[0]
+            with state.lock:
+                rid = state.receipts_by_delivery.get(did)
+                if rid:
+                    self._rows = [(rid,)]
             return
         if "INSERT INTO" in norm and ".feature_processing_states" in norm:
             state_id, project_id, feature_id, _init, pr_num, pr_sha, rep_sha = params[:7]
@@ -171,24 +187,112 @@ class _FakeCursor:
                     self._rows = []
                 else:
                     self.conn.undo_ops.append(("final_report", key))
-                    state.final_reports.add(key)
+                    state.final_reports[key] = report_id
                     self._rows = [(report_id,)]
             return
-        if "INSERT INTO" in norm and ".idempotency_keys" in norm:
-            idem_key = params[0]
+        if "SELECT report_id FROM" in norm and ".final_reports" in norm:
+            key = (params[0], params[1], params[2])
             with state.lock:
-                existing = state.idempotency_keys.get(idem_key)
-                can_claim = (
-                    existing is None
-                    or existing.get("status") == "FAILED"
-                    or (existing.get("status") == "IN_PROGRESS" and existing.get("expired"))
-                )
-                if can_claim:
-                    self.conn.undo_ops.append(("idem_key", idem_key, copy.deepcopy(existing)))
-                    state.idempotency_keys[idem_key] = {"status": "IN_PROGRESS", "expired": False}
+                rid = state.final_reports.get(key)
+                if rid:
+                    self._rows = [(rid,)]
+            return
+        if "INSERT INTO" in norm and ".idempotency_keys" in norm and "ON CONFLICT (idempotency_key) DO NOTHING" in norm:
+            idem_key, scope, project_id, feature_id, report_blob_sha, target_doc_id, _ttl = params
+            with state.lock:
+                if idem_key not in state.idempotency_keys:
+                    self.conn.undo_ops.append(("idem_key", idem_key, None))
+                    state.idempotency_keys[idem_key] = {
+                        "scope": scope,
+                        "project_id": project_id,
+                        "feature_id": feature_id,
+                        "report_blob_sha": report_blob_sha,
+                        "target_document_id": target_doc_id,
+                        "status": "IN_PROGRESS",
+                        "active_attempt_id": None,
+                        "attempt_fence_version": 0,
+                        "expired": False,
+                    }
                     self._rows = [(idem_key,)]
                 else:
                     self._rows = []
+            return
+        if "SELECT scope, project_id, feature_id, report_blob_sha, target_document_id, status" in norm and ".idempotency_keys" in norm:
+            idem_key = params[0]
+            with state.lock:
+                rec = state.idempotency_keys.get(idem_key)
+                if rec:
+                    self._rows = [
+                        (
+                            rec["scope"],
+                            rec["project_id"],
+                            rec["feature_id"],
+                            rec["report_blob_sha"],
+                            rec["target_document_id"],
+                            rec["status"],
+                            rec.get("active_attempt_id"),
+                            rec.get("attempt_fence_version", 0),
+                            bool(rec.get("expired", False)),
+                        )
+                    ]
+            return
+        if "SELECT status, active_attempt_id, attempt_fence_version" in norm and ".idempotency_keys" in norm:
+            idem_key = params[0]
+            with state.lock:
+                rec = state.idempotency_keys.get(idem_key)
+                if rec:
+                    self._rows = [
+                        (
+                            rec["status"],
+                            rec.get("active_attempt_id"),
+                            rec.get("attempt_fence_version", 0),
+                            bool(rec.get("expired", False)),
+                        )
+                    ]
+            return
+        if "SELECT status, active_attempt_id FROM" in norm and ".idempotency_keys" in norm:
+            idem_key = params[0]
+            with state.lock:
+                rec = state.idempotency_keys.get(idem_key)
+                if rec:
+                    self._rows = [(rec["status"], rec.get("active_attempt_id"))]
+            return
+        if "SELECT pa.attempt_number, pa.status, ik.status, ik.active_attempt_id, ik.attempt_fence_version" in norm:
+            attempt_id, idem_key = params
+            with state.lock:
+                att = next(
+                    (a for a in state.attempts if a["attempt_id"] == attempt_id and a["idempotency_key"] == idem_key),
+                    None,
+                )
+                ik = state.idempotency_keys.get(idem_key)
+                if att and ik:
+                    self._rows = [
+                        (
+                            att["attempt_number"],
+                            att["status"],
+                            ik["status"],
+                            ik.get("active_attempt_id"),
+                            ik.get("attempt_fence_version", 0),
+                        )
+                    ]
+            return
+        if "SELECT pa.status, ik.status, ik.active_attempt_id" in norm:
+            attempt_id, idem_key = params
+            with state.lock:
+                ik = state.idempotency_keys.get(idem_key)
+                if ik:
+                    att = next(
+                        (a for a in state.attempts if a["attempt_id"] == attempt_id and a["idempotency_key"] == idem_key),
+                        None,
+                    )
+                    self._rows = [
+                        (
+                            att["status"] if att else None,
+                            ik["status"],
+                            ik.get("active_attempt_id"),
+                            bool(ik.get("expired", False)),
+                        )
+                    ]
             return
         if "UPDATE" in norm and ".processing_attempts" in norm and "LOCK_EXPIRED" in norm:
             idem_key = params[0]
@@ -227,16 +331,20 @@ class _FakeCursor:
                 self._rows = [(attempt_id, next_num)]
             return
         if "UPDATE" in norm and ".processing_attempts" in norm:
-            attempt_status, retry_state, error_code, error_summary, idem_key, attempt_number = params
+            attempt_status, retry_state, error_code, error_summary, attempt_id, idem_key = params
             with state.lock:
                 self.conn.undo_ops.append(("attempts_snapshot", copy.deepcopy(state.attempts)))
                 for att in state.attempts:
-                    if att["idempotency_key"] == idem_key and att["attempt_number"] == attempt_number:
+                    if (
+                        att["attempt_id"] == attempt_id
+                        and att["idempotency_key"] == idem_key
+                        and att["status"] == "IN_PROGRESS"
+                    ):
                         att["status"] = attempt_status
                         att["retry_state"] = retry_state
                         att["error_code"] = error_code
                         att["error_summary"] = error_summary
-                        self._rows = [(att["attempt_id"],)]
+                        self._rows = [(att["attempt_id"], att["attempt_number"])]
                         return
                 self._rows = []
             return
@@ -263,19 +371,34 @@ class _FakeCursor:
                         )
                     ]
             return
-        if "UPDATE" in norm and ".idempotency_keys" in norm:
+        if "UPDATE" in norm and ".idempotency_keys" in norm and "active_attempt_id = NULL" in norm:
             import json as _json
 
-            status, summary_json, idem_key = params
+            status, summary_json, idem_key, active_attempt_id = params
             with state.lock:
-                if idem_key in state.idempotency_keys:
-                    self.conn.undo_ops.append(
-                        ("idem_key", idem_key, copy.deepcopy(state.idempotency_keys.get(idem_key)))
-                    )
-                    state.idempotency_keys[idem_key]["status"] = status
-                    state.idempotency_keys[idem_key]["expired"] = False
-                    state.idempotency_keys[idem_key]["result_summary"] = _json.loads(summary_json)
+                rec = state.idempotency_keys.get(idem_key)
+                if rec and rec.get("status") == "IN_PROGRESS" and rec.get("active_attempt_id") == active_attempt_id:
+                    self.conn.undo_ops.append(("idem_key", idem_key, copy.deepcopy(rec)))
+                    rec["status"] = status
+                    rec["active_attempt_id"] = None
+                    rec["attempt_fence_version"] = int(rec.get("attempt_fence_version", 0)) + 1
+                    rec["expired"] = False
+                    rec["result_summary"] = _json.loads(summary_json)
                     self._rows = [(idem_key,)]
+                else:
+                    self._rows = []
+            return
+        if "UPDATE" in norm and ".idempotency_keys" in norm and "RETURNING attempt_fence_version" in norm:
+            active_attempt_id, _ttl, idem_key = params
+            with state.lock:
+                rec = state.idempotency_keys.get(idem_key)
+                if rec:
+                    self.conn.undo_ops.append(("idem_key", idem_key, copy.deepcopy(rec)))
+                    rec["status"] = "IN_PROGRESS"
+                    rec["active_attempt_id"] = active_attempt_id
+                    rec["attempt_fence_version"] = int(rec.get("attempt_fence_version", 0)) + 1
+                    rec["expired"] = False
+                    self._rows = [(rec["attempt_fence_version"],)]
                 else:
                     self._rows = []
             return
@@ -301,6 +424,12 @@ class _FakeCursor:
                     }
                 )
                 self._rows = [(attempt_id,)]
+            return
+        if "SELECT event_id FROM" in norm and ".audit_events" in norm:
+            eid = params[0]
+            with state.lock:
+                if any(ev[0] == eid for ev in state.audit_events):
+                    self._rows = [(eid,)]
             return
         if "INSERT INTO" in norm and ".audit_events" in norm:
             self.conn.pending_ops.append(("audit", params))
@@ -357,7 +486,7 @@ class _FakeConnection:
                     version, checksum = payload  # type: ignore[misc]
                     self.state.migrations[version] = (checksum, "APPLIED")
                 elif kind == "project":
-                    self.state.projects[str(payload)] = {}
+                    self.state.projects[str(payload[0])] = tuple(payload[1:8])  # type: ignore[index]
                 elif kind == "audit":
                     self.state.audit_events.append(payload)  # type: ignore[arg-type]
             self.pending_ops.clear()
@@ -379,7 +508,7 @@ class _FakeConnection:
                     else:
                         self.state.feature_states[fkey] = prev
                 elif kind == "final_report":
-                    self.state.final_reports.discard(undo[1])
+                    self.state.final_reports.pop(undo[1], None)
                 elif kind == "idem_key":
                     ikey, prev = undo[1], undo[2]
                     if prev is None:
@@ -577,28 +706,34 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
         state = _FakeDBState()
         cfg = self._cfg()
         discovered = discover_migrations(MIGRATIONS_DIR)
-        self.assertEqual([m.version for m in discovered], ["0001", "0002"])
+        self.assertEqual([m.version for m in discovered], ["0001", "0002", "0003"])
 
-        # Plan on empty DB shows both pending
+        # Plan on empty DB shows all pending
         plan = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=True, connect_fn=lambda _c: _FakeConnection(state))
-        self.assertEqual(plan["pending"], ["0001_initial_utda_schema", "0002_roles_and_indexes"])
+        self.assertEqual(
+            plan["pending"],
+            ["0001_initial_utda_schema", "0002_roles_and_indexes", "0003_idempotency_fencing"],
+        )
 
         # Apply from empty DB
         res1 = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False, connect_fn=lambda _c: _FakeConnection(state))
-        self.assertEqual(res1["applied"], ["0001_initial_utda_schema", "0002_roles_and_indexes"])
+        self.assertEqual(
+            res1["applied"],
+            ["0001_initial_utda_schema", "0002_roles_and_indexes", "0003_idempotency_fencing"],
+        )
 
         # Re-running is safe / no pending migrations
         res2 = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False, connect_fn=lambda _c: _FakeConnection(state))
         self.assertEqual(res2["applied"], [])
 
-        # Simulate upgrade with a 0003 migration in a temp directory + failure rollback
+        # Simulate upgrade with a 0004 migration in a temp directory + failure rollback
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             for m in discovered:
                 (tmp_dir / m.path.name).write_text(m.sql, encoding="utf-8")
-            (tmp_dir / "0003_add_sample.sql").write_text("SELECT 1;", encoding="utf-8")
+            (tmp_dir / "0004_add_sample.sql").write_text("SELECT 1;", encoding="utf-8")
             res3 = apply_migrations(cfg, tmp_dir, dry_run=False, connect_fn=lambda _c: _FakeConnection(state))
-            self.assertEqual(res3["applied"], ["0003_add_sample"])
+            self.assertEqual(res3["applied"], ["0004_add_sample"])
 
             # Altering already-applied 0001 raises checksum mismatch
             (tmp_dir / "0001_initial_utda_schema.sql").write_text("-- tampered", encoding="utf-8")
@@ -713,6 +848,8 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             )
             self.assertTrue(r1["inserted"])
             self.assertFalse(r2["inserted"])
+            self.assertIsNotNone(r1["receipt_id"])
+            self.assertEqual(r2["receipt_id"], r1["receipt_id"])
 
             # Correlation: PR merge first -> WAITING_FOR_FINAL_REPORT -> report push -> READY
             s1 = repo.correlate_feature_state(
@@ -729,7 +866,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             )
             self.assertEqual(s2["status"], "READY")
 
-            # Report metadata persistence
+            # Report metadata persistence + duplicate returning existing report_id
             rep = repo.record_final_report(
                 project_id="UTDA_PILOT",
                 feature_id="FEAT-1",
@@ -742,33 +879,49 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
                 report_metadata={"summary": "Added auth"},
                 evidence_refs=[{"kind": "commit", "reference": "def5678"}],
             )
+            rep2 = repo.record_final_report(
+                project_id="UTDA_PILOT",
+                feature_id="FEAT-1",
+                feature_name="Auth",
+                change_type="api_change",
+                implementation_status="implemented",
+                report_path="documentation/reports/final/FEAT-1.json",
+                report_blob_sha="blob999",
+                git_commit_sha="def5678",
+                report_metadata={"summary": "Added auth"},
+                evidence_refs=[{"kind": "commit", "reference": "def5678"}],
+            )
             self.assertTrue(rep["inserted"])
+            self.assertFalse(rep2["inserted"])
+            self.assertIsNotNone(rep["report_id"])
+            self.assertEqual(rep2["report_id"], rep["report_id"])
 
-            # Concurrent idempotency contention: exactly 1 of 6 workers wins
-            def _claim(_idx: int) -> bool:
-                return repo.acquire_idempotency_key(
+            # Concurrent fenced idempotency contention: exactly 1 of 6 workers wins
+            def _claim(_idx: int) -> dict:
+                return repo.claim_idempotency_and_attempt(
                     idempotency_key="UNAI-TECH/pilot:FEAT-1:blob999:D06",
                     scope="document_update",
                     project_id="UTDA_PILOT",
                     feature_id="FEAT-1",
                     report_blob_sha="blob999",
                     target_document_id="D06",
+                    event_receipt_id=r1["receipt_id"],
                 )
 
             with ThreadPoolExecutor(max_workers=6) as ex:
-                winners = list(ex.map(_claim, range(6)))
-            self.assertEqual(sum(1 for w in winners if w), 1)
+                claims = list(ex.map(_claim, range(6)))
+            winners = [c for c in claims if c["claimed"]]
+            self.assertEqual(len(winners), 1)
+            winner_attempt_id = winners[0]["attempt_id"]
 
-            repo.complete_idempotency_key(
-                idempotency_key="UNAI-TECH/pilot:FEAT-1:blob999:D06",
-                status="COMPLETED",
-                result_summary={"pr": 11},
-            )
-            repo.record_processing_attempt(
+            repo.finalize_processing_attempt(
                 event_receipt_id=r1["receipt_id"],
                 idempotency_key="UNAI-TECH/pilot:FEAT-1:blob999:D06",
+                attempt_id=winner_attempt_id,
                 attempt_number=1,
-                status="SUCCEEDED",
+                attempt_status="SUCCEEDED",
+                final_key_status="COMPLETED",
+                result_summary={"pr": 11},
             )
             repo.append_audit_event(
                 actor="utda-bot",
@@ -900,6 +1053,8 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             self.assertNotIn(leak, persisted)
 
     def test_atomic_attempt_completion_concurrency_and_ambiguous_commit(self) -> None:
+        import warnings
+
         state = _FakeDBState()
         state.tables_initialized = True
         pool = _FakePool(state)
@@ -924,27 +1079,88 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
                 claims = list(ex.map(_worker, range(8)))
             winners = [c for c in claims if c["claimed"]]
             self.assertEqual(len(winners), 1)
+            att1_id = winners[0]["attempt_id"]
+            self.assertTrue(att1_id)
             self.assertEqual(winners[0]["attempt_number"], 1)
+            self.assertEqual(state.idempotency_keys[idem]["active_attempt_id"], att1_id)
             self.assertEqual(len(state.attempts), 1)
             self.assertEqual(state.attempts[0]["status"], "IN_PROGRESS")
 
-            # Simulate worker failing between lock acquisition and completion (lock expires)
+            # Idempotency identity mismatch across any immutable field is rejected fail-closed
+            for bad_kwargs in (
+                {"scope": "wrong_scope"},
+                {"project_id": "OTHER_PROJ"},
+                {"feature_id": "OTHER_FEAT"},
+                {"report_blob_sha": "other-blob"},
+                {"target_document_id": "D99"},
+            ):
+                base_req = {
+                    "idempotency_key": idem,
+                    "scope": "phase1_correlation",
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-ATM",
+                    "report_blob_sha": "blob-atm",
+                    "target_document_id": "D06",
+                    "event_receipt_id": None,
+                }
+                base_req.update(bad_kwargs)
+                with self.assertRaises(IdempotencyIdentityMismatchError):
+                    repo.claim_idempotency_and_attempt(**base_req)
+
+            # Simulate worker 1 expiring before completion -> worker 2 takes over with att2_id
             state.idempotency_keys[idem]["expired"] = True
             with ThreadPoolExecutor(max_workers=6) as ex:
                 recovery_claims = list(ex.map(_worker, range(6)))
             rec_winners = [c for c in recovery_claims if c["claimed"]]
             self.assertEqual(len(rec_winners), 1)
+            att2_id = rec_winners[0]["attempt_id"]
+            self.assertNotEqual(att2_id, att1_id)
             self.assertEqual(rec_winners[0]["attempt_number"], 2)
             self.assertEqual(state.attempts[0]["status"], "FAILED")
             self.assertEqual(state.attempts[0]["retry_state"], "LOCK_EXPIRED")
             self.assertEqual([a["attempt_number"] for a in state.attempts], [1, 2])
+            self.assertEqual(state.idempotency_keys[idem]["active_attempt_id"], att2_id)
+
+            # Stale worker 1 is rejected without altering attempt 2 or idempotency key state
+            with self.assertRaises(StaleAttemptError):
+                repo.finalize_processing_attempt(
+                    event_receipt_id=None,
+                    idempotency_key=idem,
+                    attempt_id=att1_id,
+                    attempt_number=1,
+                    attempt_status="SUCCEEDED",
+                    final_key_status="COMPLETED",
+                    result_summary={"stale": True},
+                )
+            self.assertEqual(state.attempts[1]["status"], "IN_PROGRESS")
+            self.assertEqual(state.idempotency_keys[idem]["status"], "IN_PROGRESS")
+            self.assertEqual(state.idempotency_keys[idem]["active_attempt_id"], att2_id)
+
+            # Deprecated legacy methods cannot bypass fencing without matching active attempt_id
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with self.assertRaises(StaleAttemptError):
+                    repo.complete_idempotency_key(idempotency_key=idem, status="COMPLETED")
+                with self.assertRaises(StaleAttemptError):
+                    repo.complete_idempotency_key(
+                        idempotency_key=idem, status="COMPLETED", attempt_id=att1_id
+                    )
+                with self.assertRaises(StaleAttemptError):
+                    repo.record_processing_attempt(
+                        event_receipt_id=None,
+                        idempotency_key=idem,
+                        attempt_number=99,
+                        status="SUCCEEDED",
+                    )
+                self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
 
             # Mid-transaction SQL failure on idempotency_keys update rolls back attempt update too
-            state.fail_sql_substring = 'UPDATE "utda"."idempotency_keys"'
+            state.fail_sql_substring = "AND active_attempt_id = %s"
             with self.assertRaises(RuntimeError):
                 repo.finalize_processing_attempt(
                     event_receipt_id=None,
                     idempotency_key=idem,
+                    attempt_id=att2_id,
                     attempt_number=2,
                     attempt_status="SUCCEEDED",
                     final_key_status="COMPLETED",
@@ -953,11 +1169,12 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             self.assertEqual(state.attempts[1]["status"], "IN_PROGRESS")
             self.assertEqual(state.idempotency_keys[idem]["status"], "IN_PROGRESS")
 
-            # Clear SQL failure and finalize atomically (verifying summary sanitization too)
+            # Clear SQL failure and finalize atomically with active attempt_id
             state.fail_sql_substring = None
             repo.finalize_processing_attempt(
                 event_receipt_id=None,
                 idempotency_key=idem,
+                attempt_id=att2_id,
                 attempt_number=2,
                 attempt_status="SUCCEEDED",
                 final_key_status="COMPLETED",
@@ -965,10 +1182,21 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             )
             self.assertEqual(state.attempts[1]["status"], "SUCCEEDED")
             self.assertEqual(state.idempotency_keys[idem]["status"], "COMPLETED")
+            self.assertIsNone(state.idempotency_keys[idem]["active_attempt_id"])
             self.assertNotIn("raw-secret-api-key", repr(state.idempotency_keys[idem]["result_summary"]))
 
-        # Ambiguous commit outcome: transient failure during COMMIT raises CommitOutcomeUnknownError
-        # without blindly replaying potentially committed non-idempotent transactions.
+            # Duplicate finalization even with att2_id is rejected once completed
+            with self.assertRaises(StaleAttemptError):
+                repo.finalize_processing_attempt(
+                    event_receipt_id=None,
+                    idempotency_key=idem,
+                    attempt_id=att2_id,
+                    attempt_number=2,
+                    attempt_status="SUCCEEDED",
+                    final_key_status="COMPLETED",
+                )
+
+        # Ambiguous commit outcome: DatabaseManager.run_in_transaction NEVER retries after commit drop
         ambig_pool = _FakePool(state, fail_commit_times=1, commit_drops_after_apply=True)
         with DatabaseManager(self._cfg(), pool_factory=lambda _c: ambig_pool, sleep_fn=lambda _s: None) as db:
             calls = {"count": 0}
@@ -983,20 +1211,54 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
                 db.run_in_transaction(_non_idempotent_op)
             self.assertEqual(calls["count"], 1)
 
-        # Explicitly marked idempotent operation CAN retry safely on commit drop
-        retry_commit_pool = _FakePool(state, fail_commit_times=1, commit_drops_after_apply=True)
-        with DatabaseManager(self._cfg(), pool_factory=lambda _c: retry_commit_pool, sleep_fn=lambda _s: None) as db:
-            idem_calls = {"count": 0}
+        # Repository reconciliation after commit drop (when server committed):
+        # stable operation IDs reconcile without creating duplicate claims, attempts, receipts, reports, or audits
+        reconcile_pool = _FakePool(state, fail_commit_times=4, commit_drops_after_apply=True)
+        with DatabaseManager(self._cfg(), pool_factory=lambda _c: reconcile_pool, sleep_fn=lambda _s: None) as db:
+            repo = UTDADatabaseRepository(db)
+            rec_claim = repo.claim_idempotency_and_attempt(
+                idempotency_key="reconcile-idem-1",
+                scope="phase1_correlation",
+                project_id="UTDA_PILOT",
+                feature_id="FEAT-REC-COMMIT",
+                report_blob_sha="blob-rc",
+                target_document_id="D06",
+                event_receipt_id=None,
+            )
+            self.assertTrue(rec_claim["claimed"])
+            self.assertTrue(rec_claim.get("reconciled"))
+            self.assertEqual(rec_claim["attempt_number"], 1)
 
-            def _idempotent_op(conn) -> str:
-                idem_calls["count"] += 1
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                return "ok-after-commit-retry"
+            rec_fin_id = repo.finalize_processing_attempt(
+                event_receipt_id=None,
+                idempotency_key="reconcile-idem-1",
+                attempt_id=rec_claim["attempt_id"],
+                attempt_number=1,
+                attempt_status="SUCCEEDED",
+                final_key_status="COMPLETED",
+                result_summary={"ok": True},
+            )
+            self.assertEqual(rec_fin_id, rec_claim["attempt_id"])
 
-            res = db.run_in_transaction(_idempotent_op, retry_on_ambiguous_commit=True)
-            self.assertEqual(res, "ok-after-commit-retry")
-            self.assertEqual(idem_calls["count"], 2)
+            rec_receipt = repo.record_event_receipt(
+                delivery_id="reconcile-deliv-1",
+                event_name="push",
+                repository="UNAI-TECH/pilot",
+                project_id="UTDA_PILOT",
+                feature_id="FEAT-REC-COMMIT",
+                git_sha="abc1234",
+            )
+            self.assertTrue(rec_receipt["inserted"])
+            self.assertTrue(rec_receipt.get("reconciled"))
+
+            before_audits = len(state.audit_events)
+            ev_id = repo.append_audit_event(
+                actor="utda_runtime",
+                event_type="RECONCILE_TEST",
+                project_id="UTDA_PILOT",
+            )
+            self.assertTrue(ev_id)
+            self.assertEqual(len(state.audit_events), before_audits + 1)
 
 
 class Phase1LivePostgreSQLTests(unittest.TestCase):
@@ -1062,7 +1324,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             tmp_dir = Path(tmp)
             for m in discover_migrations(MIGRATIONS_DIR):
                 (tmp_dir / m.path.name).write_text(m.sql, encoding="utf-8")
-            (tmp_dir / "0003_broken.sql").write_text(
+            (tmp_dir / "0004_broken.sql").write_text(
                 "CREATE TABLE utda.should_not_exist (id INT); THIS IS INVALID SQL;",
                 encoding="utf-8",
             )
@@ -1133,7 +1395,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             migration_sslmode=cfg.migration_sslmode,
         )
         dry_plan = apply_migrations(dry_cfg, MIGRATIONS_DIR, dry_run=True)
-        self.assertEqual(len(dry_plan["pending"]), 2)
+        self.assertEqual(len(dry_plan["pending"]), 3)
         with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as chk:
             with chk.cursor() as cur:
                 cur.execute(
@@ -1192,40 +1454,49 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 github_repo="ci-local-test",
                 default_branch="main",
             )
-            claimed = repo.acquire_idempotency_key(
+            claim1 = repo.claim_idempotency_and_attempt(
                 idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
                 scope="ci_test",
                 project_id="CI_LOCAL_TEST",
                 feature_id="FEAT-CI",
                 report_blob_sha="sha1",
                 target_document_id="D06",
+                event_receipt_id=None,
             )
-            self.assertTrue(claimed)
+            self.assertTrue(claim1["claimed"])
+            self.assertTrue(claim1["attempt_id"])
             self.assertFalse(
-                repo.acquire_idempotency_key(
+                repo.claim_idempotency_and_attempt(
                     idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
                     scope="ci_test",
                     project_id="CI_LOCAL_TEST",
                     feature_id="FEAT-CI",
                     report_blob_sha="sha1",
                     target_document_id="D06",
-                )
+                    event_receipt_id=None,
+                )["claimed"]
             )
-            repo.complete_idempotency_key(
+            repo.finalize_processing_attempt(
+                event_receipt_id=None,
                 idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
-                status="FAILED",
+                attempt_id=claim1["attempt_id"],
+                attempt_number=claim1["attempt_number"],
+                attempt_status="FAILED",
+                final_key_status="FAILED",
+                retry_state="RETRY_SCHEDULED",
                 result_summary={"error": "transient"},
             )
-            self.assertTrue(
-                repo.acquire_idempotency_key(
-                    idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
-                    scope="ci_test",
-                    project_id="CI_LOCAL_TEST",
-                    feature_id="FEAT-CI",
-                    report_blob_sha="sha1",
-                    target_document_id="D06",
-                )
+            claim2 = repo.claim_idempotency_and_attempt(
+                idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
+                scope="ci_test",
+                project_id="CI_LOCAL_TEST",
+                feature_id="FEAT-CI",
+                report_blob_sha="sha1",
+                target_document_id="D06",
+                event_receipt_id=None,
             )
+            self.assertTrue(claim2["claimed"])
+            self.assertEqual(claim2["attempt_number"], 2)
 
     @unittest.skipUnless(
         os.getenv("UTDA_TEST_DATABASE_URL")
@@ -1364,25 +1635,23 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 evidence_refs=[],
             )
             self.assertTrue(rep["inserted"])
-            self.assertTrue(
-                repo.acquire_idempotency_key(
-                    idempotency_key="ci-sec-idem-1",
-                    scope="sec_test",
-                    project_id="CI_SEC_TEST",
-                    feature_id="FEAT-SEC",
-                    report_blob_sha="blob-sec",
-                    target_document_id="D06",
-                )
+            sec_claim = repo.claim_idempotency_and_attempt(
+                idempotency_key="ci-sec-idem-1",
+                scope="sec_test",
+                project_id="CI_SEC_TEST",
+                feature_id="FEAT-SEC",
+                report_blob_sha="blob-sec",
+                target_document_id="D06",
+                event_receipt_id=receipt["receipt_id"],
             )
-            repo.record_processing_attempt(
+            self.assertTrue(sec_claim["claimed"])
+            repo.finalize_processing_attempt(
                 event_receipt_id=receipt["receipt_id"],
                 idempotency_key="ci-sec-idem-1",
+                attempt_id=sec_claim["attempt_id"],
                 attempt_number=1,
-                status="SUCCEEDED",
-            )
-            repo.complete_idempotency_key(
-                idempotency_key="ci-sec-idem-1",
-                status="COMPLETED",
+                attempt_status="SUCCEEDED",
+                final_key_status="COMPLETED",
                 result_summary={"ok": True},
             )
             repo.append_audit_event(
@@ -1560,7 +1829,10 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
         res = apply_migrations(
             boot_cfg, MIGRATIONS_DIR, dry_run=False, allow_bootstrap_role=True
         )
-        self.assertEqual(res["applied"], ["0001_initial_utda_schema", "0002_roles_and_indexes"])
+        self.assertEqual(
+            res["applied"],
+            ["0001_initial_utda_schema", "0002_roles_and_indexes", "0003_idempotency_fencing"],
+        )
         with psycopg.connect(boot_cfg.dsn, **boot_cfg.connect_kwargs()) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1594,6 +1866,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 github_repo="ci-conc-test",
                 default_branch="main",
             )
+            # Duplicate receipt returns exact original receipt_id
             rec = repo.record_event_receipt(
                 delivery_id=delivery,
                 event_name="push",
@@ -1606,8 +1879,48 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     "nested": [{"note": "ghp_1234567890123456789012345678901234"}],
                 },
             )
+            rec_dup = repo.record_event_receipt(
+                delivery_id=delivery,
+                event_name="push",
+                repository="UNAI-TECH/ci-conc-test",
+                project_id="CI_CONC_TEST",
+                feature_id="FEAT-CONC",
+                git_sha="abc1234",
+            )
             self.assertTrue(rec["inserted"])
+            self.assertFalse(rec_dup["inserted"])
+            self.assertEqual(rec_dup["receipt_id"], rec["receipt_id"])
 
+            # Duplicate report returns exact original report_id
+            rep1 = repo.record_final_report(
+                project_id="CI_CONC_TEST",
+                feature_id="FEAT-CONC",
+                feature_name="Concurrency & Fencing",
+                change_type="database_change",
+                implementation_status="implemented",
+                report_path="documentation/reports/final/FEAT-CONC.json",
+                report_blob_sha="blob-conc",
+                git_commit_sha="abc1234",
+                report_metadata={"summary": "Concurrent PG16 check"},
+                evidence_refs=[{"kind": "commit", "reference": "abc1234"}],
+            )
+            rep2 = repo.record_final_report(
+                project_id="CI_CONC_TEST",
+                feature_id="FEAT-CONC",
+                feature_name="Concurrency & Fencing",
+                change_type="database_change",
+                implementation_status="implemented",
+                report_path="documentation/reports/final/FEAT-CONC.json",
+                report_blob_sha="blob-conc",
+                git_commit_sha="abc1234",
+                report_metadata={"summary": "Concurrent PG16 check"},
+                evidence_refs=[{"kind": "commit", "reference": "abc1234"}],
+            )
+            self.assertTrue(rep1["inserted"])
+            self.assertFalse(rep2["inserted"])
+            self.assertEqual(rep2["report_id"], rep1["report_id"])
+
+            # Concurrent claims on real PG16: 8 threads -> 1 winner returns attempt_id #1
             def _claim_pg(_idx: int) -> dict:
                 return repo.claim_idempotency_and_attempt(
                     idempotency_key=idem,
@@ -1623,9 +1936,32 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 first_wave = list(ex.map(_claim_pg, range(8)))
             first_winners = [c for c in first_wave if c["claimed"]]
             self.assertEqual(len(first_winners), 1)
+            att1_id = first_winners[0]["attempt_id"]
+            self.assertTrue(att1_id)
             self.assertEqual(first_winners[0]["attempt_number"], 1)
 
-            # Expire lock in DB (simulating crash between lock claim and finish) -> concurrent recovery
+            # Immutable identity mismatch rejected on real PG16 across every protected column
+            for override in (
+                {"scope": "mismatch"},
+                {"project_id": "OTHER"},
+                {"feature_id": "OTHER"},
+                {"report_blob_sha": "mismatch"},
+                {"target_document_id": "D99"},
+            ):
+                req = {
+                    "idempotency_key": idem,
+                    "scope": "phase1_correlation",
+                    "project_id": "CI_CONC_TEST",
+                    "feature_id": "FEAT-CONC",
+                    "report_blob_sha": "blob-conc",
+                    "target_document_id": "D06",
+                    "event_receipt_id": rec["receipt_id"],
+                    **override,
+                }
+                with self.assertRaises(IdempotencyIdentityMismatchError):
+                    repo.claim_idempotency_and_attempt(**req)
+
+            # Expire lock in DB -> 6 concurrent recovery workers -> 1 winner returns att2_id #2
             with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as aconn:
                 with aconn.cursor() as cur:
                     cur.execute(
@@ -1638,26 +1974,115 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 second_wave = list(ex.map(_claim_pg, range(6)))
             second_winners = [c for c in second_wave if c["claimed"]]
             self.assertEqual(len(second_winners), 1)
+            att2_id = second_winners[0]["attempt_id"]
+            self.assertNotEqual(att2_id, att1_id)
             self.assertEqual(second_winners[0]["attempt_number"], 2)
 
-            # Finalize atomically with sanitized summary
-            repo.finalize_processing_attempt(
-                event_receipt_id=rec["receipt_id"],
-                idempotency_key=idem,
-                attempt_number=2,
-                attempt_status="SUCCEEDED",
-                final_key_status="COMPLETED",
-                result_summary={"access_token": "pg16-secret-tok", "status": "ok"},
-            )
+            # Stale worker 1 finalization rejected without changing attempt 2 or idempotency key
+            with self.assertRaises(StaleAttemptError):
+                repo.finalize_processing_attempt(
+                    event_receipt_id=rec["receipt_id"],
+                    idempotency_key=idem,
+                    attempt_id=att1_id,
+                    attempt_number=1,
+                    attempt_status="SUCCEEDED",
+                    final_key_status="COMPLETED",
+                    result_summary={"stale": True},
+                )
+            with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as chk:
+                with chk.cursor() as cur:
+                    cur.execute(
+                        "SELECT status, active_attempt_id FROM utda.idempotency_keys WHERE idempotency_key = %s",
+                        (idem,),
+                    )
+                    self.assertEqual(cur.fetchone(), ("IN_PROGRESS", att2_id))
+
+            # Rollback & recovery inside transaction: fault mid-transaction leaves attempt 2 IN_PROGRESS
+            with self.assertRaises(RuntimeError):
+                def _failing_tx(conn) -> None:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE utda.processing_attempts SET error_code = 'MID_FAIL' WHERE attempt_id = %s",
+                            (att2_id,),
+                        )
+                    raise RuntimeError("Simulated mid-transaction abort")
+
+                db.run_in_transaction(_failing_tx)
+
+            # Real PG16 ambiguous commit test: drop connection right after server COMMIT
+            # 1) DatabaseManager.run_in_transaction raises CommitOutcomeUnknownError (0 generic retries)
+            # 2) Fenced repository finalization reconciles safely via stable attempt_id!
+            orig_commit_pool_fn = db._pool.connection
+
+            class _DropOnceCommitConnProxy:
+                def __init__(self, inner) -> None:
+                    self._inner = inner
+                    self._dropped = False
+
+                def cursor(self, *args, **kwargs):
+                    return self._inner.cursor(*args, **kwargs)
+
+                def rollback(self):
+                    return self._inner.rollback()
+
+                def commit(self):
+                    self._inner.commit()
+                    if not self._dropped:
+                        self._dropped = True
+                        raise psycopg.OperationalError("Simulated PG16 post-commit socket drop")
+
+            drop_state = {"armed": True}
+            from contextlib import contextmanager as _cm
+
+            @_cm
+            def _drop_once_conn(timeout: float = 10.0):
+                with orig_commit_pool_fn(timeout=timeout) as real_conn:
+                    if drop_state["armed"]:
+                        drop_state["armed"] = False
+                        yield _DropOnceCommitConnProxy(real_conn)
+                    else:
+                        yield real_conn
+
+            db._pool.connection = _drop_once_conn  # type: ignore[method-assign]
+            try:
+                fin_res = repo.finalize_processing_attempt(
+                    event_receipt_id=rec["receipt_id"],
+                    idempotency_key=idem,
+                    attempt_id=att2_id,
+                    attempt_number=2,
+                    attempt_status="SUCCEEDED",
+                    final_key_status="COMPLETED",
+                    result_summary={"access_token": "pg16-secret-tok", "status": "ok"},
+                )
+                self.assertEqual(fin_res, att2_id)
+            finally:
+                db._pool.connection = orig_commit_pool_fn  # type: ignore[method-assign]
+
+            # Stale attempt or already-completed attempt cannot finalize again
+            with self.assertRaises(StaleAttemptError):
+                repo.finalize_processing_attempt(
+                    event_receipt_id=rec["receipt_id"],
+                    idempotency_key=idem,
+                    attempt_id=att2_id,
+                    attempt_number=2,
+                    attempt_status="FAILED",
+                    final_key_status="FAILED",
+                )
 
         with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as rconn:
             with rconn.cursor() as cur:
                 cur.execute(
-                    "SELECT attempt_number, status, retry_state FROM utda.processing_attempts WHERE idempotency_key = %s ORDER BY attempt_number",
+                    "SELECT attempt_number, status, retry_state, error_code FROM utda.processing_attempts WHERE idempotency_key = %s ORDER BY attempt_number",
                     (idem,),
                 )
                 rows = cur.fetchall()
-                self.assertEqual(rows, [(1, "FAILED", "LOCK_EXPIRED"), (2, "SUCCEEDED", "NONE")])
+                self.assertEqual(
+                    rows,
+                    [
+                        (1, "FAILED", "LOCK_EXPIRED", "LOCK_EXPIRED"),
+                        (2, "SUCCEEDED", "NONE", None),
+                    ],
+                )
 
                 cur.execute(
                     "SELECT payload_summary::text FROM utda.github_event_receipts WHERE delivery_id = %s",
@@ -1668,11 +2093,13 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 self.assertNotIn("ghp_1234567890123456789012345678901234", payload_text)
 
                 cur.execute(
-                    "SELECT status, result_summary::text FROM utda.idempotency_keys WHERE idempotency_key = %s",
+                    "SELECT status, active_attempt_id, attempt_fence_version, result_summary::text FROM utda.idempotency_keys WHERE idempotency_key = %s",
                     (idem,),
                 )
-                kstatus, ksummary = cur.fetchone()
+                kstatus, kactive, kfence, ksummary = cur.fetchone()
                 self.assertEqual(kstatus, "COMPLETED")
+                self.assertIsNone(kactive)
+                self.assertGreaterEqual(kfence, 3)
                 self.assertNotIn("pg16-secret-tok", ksummary)
 
     @unittest.skipUnless(
