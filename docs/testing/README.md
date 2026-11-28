@@ -15,6 +15,7 @@ This directory maintains the mandatory Markdown verification reports for impleme
 
 | Date | Task | Commit SHA | Assessment | Report |
 | --- | --- | --- | --- | --- |
+| 2026-11-28 | Phase 2B.4.1 — Worker Lease Heartbeat & Renewal | `a6de001` | **PASS WITH LIMITATIONS** | [2026-11-28-phase2b-4-1-lease-heartbeat-a6de001.md](2026-11-28-phase2b-4-1-lease-heartbeat-a6de001.md) |
 | 2026-11-28 | Phase 2B.3 — RLS Architecture, Migration `0005` & PostgreSQL 16 Verification | `6712928` | **PASS WITH LIMITATIONS** | [2026-11-28-phase2b-3-rls-pg16-verification-6712928.md](2026-11-28-phase2b-3-rls-pg16-verification-6712928.md) |
 | 2026-11-28 | Phase 2B.2 — PostgreSQL 16 Verification & Project-Scoping Closure | `7e1dc5c` | **VERIFIED** | [2026-11-28-phase2b-2-pg16-verification-closure-7e1dc5c.md](2026-11-28-phase2b-2-pg16-verification-closure-7e1dc5c.md) |
 | 2026-11-28 | Phase 2B.1–2B.2 — Authoritative Project Identity & Transaction-Local DB Context | `7e1dc5c` | **PASS WITH LIMITATIONS** | [2026-11-28-phase2b-1-2-project-identity-db-context.md](2026-11-28-phase2b-1-2-project-identity-db-context.md) |
