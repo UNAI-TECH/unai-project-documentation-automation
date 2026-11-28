@@ -1,14 +1,27 @@
 """Durable Phase 1 audit, correlation, idempotency, and retry-state store."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from engine.database import UTDADatabaseRepository
 from engine.db_config import validate_project_id
+from engine.lease_heartbeat import LeaseConfig, LeaseHeartbeat
 from engine.sanitization import sanitize_value, scrub_secrets
+
+
+@dataclass(frozen=True)
+class ProcessingLease:
+    """Structured lease ownership metadata returned by claim_processing_lease."""
+
+    claimed: bool
+    attempt_number: int
+    attempt_id: str | None
+    fence_version: int | None
+    key_status: str = "IN_PROGRESS"
 
 
 def make_event_key(repository: str, feature_id: str, report_blob_sha: str) -> str:
@@ -146,6 +159,47 @@ class AuditStore:
             evidence_refs=sanitize_value(report.get("evidence", [])),
         )
 
+    def claim_processing_lease(
+        self,
+        *,
+        idempotency_key: str,
+        scope: str,
+        project_id: str,
+        feature_id: str,
+        report_blob_sha: str,
+        target_document_id: str,
+        event_receipt_id: str | None,
+        lock_ttl_seconds: int = 180,
+    ) -> ProcessingLease:
+        """Claim a fenced processing lease and expose attempt_id and fence_version."""
+        pid = validate_project_id(project_id)
+        if not self.repo:
+            return ProcessingLease(
+                claimed=True,
+                attempt_number=1,
+                attempt_id=f"local-{idempotency_key}",
+                fence_version=1,
+                key_status="IN_PROGRESS",
+            )
+        claimed = self.repo.claim_idempotency_and_attempt(
+            idempotency_key=idempotency_key,
+            scope=scope,
+            project_id=pid,
+            feature_id=feature_id,
+            report_blob_sha=report_blob_sha,
+            target_document_id=target_document_id,
+            event_receipt_id=event_receipt_id,
+            lock_ttl_seconds=lock_ttl_seconds,
+        )
+        raw_fence = claimed.get("fence_version")
+        return ProcessingLease(
+            claimed=bool(claimed["claimed"]),
+            attempt_number=int(claimed["attempt_number"]),
+            attempt_id=claimed.get("attempt_id"),
+            fence_version=int(raw_fence) if raw_fence is not None else None,
+            key_status=str(claimed.get("key_status") or "IN_PROGRESS"),
+        )
+
     def claim_processing_lock(
         self,
         *,
@@ -158,20 +212,65 @@ class AuditStore:
         event_receipt_id: str | None,
         lock_ttl_seconds: int = 900,
     ) -> tuple[bool, int, str | None]:
-        pid = validate_project_id(project_id)
-        if not self.repo:
-            return True, 1, f"local-{idempotency_key}"
-        claimed = self.repo.claim_idempotency_and_attempt(
+        lease = self.claim_processing_lease(
             idempotency_key=idempotency_key,
             scope=scope,
-            project_id=pid,
+            project_id=project_id,
             feature_id=feature_id,
             report_blob_sha=report_blob_sha,
             target_document_id=target_document_id,
             event_receipt_id=event_receipt_id,
             lock_ttl_seconds=lock_ttl_seconds,
         )
-        return bool(claimed["claimed"]), int(claimed["attempt_number"]), claimed.get("attempt_id")
+        return lease.claimed, lease.attempt_number, lease.attempt_id
+
+    def renew_processing_lease(
+        self,
+        *,
+        project_id: str,
+        idempotency_key: str,
+        attempt_id: str,
+        expected_fence_version: int | None = None,
+        extend_ttl_seconds: int = 180,
+    ) -> dict[str, Any]:
+        """Renew an active attempt lease via short-lived project-scoped DB transaction."""
+        pid = validate_project_id(project_id)
+        if not self.repo:
+            return {
+                "renewed": True,
+                "idempotency_key": idempotency_key,
+                "attempt_id": attempt_id,
+                "fence_version": expected_fence_version if expected_fence_version is not None else 1,
+                "local_only": True,
+            }
+        return self.repo.renew_attempt_lease(
+            project_id=pid,
+            idempotency_key=idempotency_key,
+            attempt_id=attempt_id,
+            expected_fence_version=expected_fence_version,
+            extend_ttl_seconds=extend_ttl_seconds,
+        )
+
+    def lease_heartbeat(
+        self,
+        *,
+        project_id: str,
+        idempotency_key: str,
+        attempt_id: str,
+        expected_fence_version: int | None = None,
+        config: LeaseConfig | None = None,
+        on_lease_lost: Callable[[BaseException], None] | None = None,
+    ) -> LeaseHeartbeat:
+        """Create a coordinated LeaseHeartbeat bound to this AuditStore's renewal path."""
+        return LeaseHeartbeat(
+            project_id=project_id,
+            idempotency_key=idempotency_key,
+            attempt_id=attempt_id,
+            expected_fence_version=expected_fence_version,
+            renew_fn=self.renew_processing_lease,
+            config=config,
+            on_lease_lost=on_lease_lost,
+        )
 
     def record_attempt_outcome(
         self,
@@ -181,6 +280,7 @@ class AuditStore:
         idempotency_key: str,
         attempt_id: str,
         attempt_number: int | None = None,
+        expected_fence_version: int | None = None,
         succeeded: bool,
         final_key_status: str,
         retry_state: str = "NONE",
@@ -197,6 +297,7 @@ class AuditStore:
             idempotency_key=idempotency_key,
             attempt_id=attempt_id,
             attempt_number=attempt_number,
+            expected_fence_version=expected_fence_version,
             attempt_status="SUCCEEDED" if succeeded else "FAILED",
             final_key_status=final_key_status,
             retry_state=retry_state,

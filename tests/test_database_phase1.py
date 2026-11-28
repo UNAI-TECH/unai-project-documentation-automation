@@ -207,7 +207,9 @@ class _FakeCursor:
                     self._rows = [(rid,)]
             return
         if "INSERT INTO" in norm and ".idempotency_keys" in norm and "ON CONFLICT (idempotency_key) DO NOTHING" in norm:
-            idem_key, scope, project_id, feature_id, report_blob_sha, target_doc_id, _ttl = params
+            from datetime import datetime, timedelta, timezone
+
+            idem_key, scope, project_id, feature_id, report_blob_sha, target_doc_id, ttl_sec = params
             with state.lock:
                 if idem_key not in state.idempotency_keys:
                     self.conn.undo_ops.append(("idem_key", idem_key, None))
@@ -221,6 +223,7 @@ class _FakeCursor:
                         "active_attempt_id": None,
                         "attempt_fence_version": 0,
                         "expired": False,
+                        "expires_at": datetime.now(timezone.utc) + timedelta(seconds=int(ttl_sec)),
                     }
                     self._rows = [(idem_key,)]
                 else:
@@ -296,6 +299,26 @@ class _FakeCursor:
                             ik["status"],
                             ik.get("active_attempt_id"),
                             ik.get("attempt_fence_version", 0),
+                        )
+                    ]
+            return
+        if "SELECT ik.status, ik.active_attempt_id, ik.attempt_fence_version" in norm:
+            attempt_id, idem_key, proj_filter = params
+            with state.lock:
+                ik = state.idempotency_keys.get(idem_key)
+                if ik and ik.get("project_id") == proj_filter:
+                    att = next(
+                        (a for a in state.attempts if a["attempt_id"] == attempt_id and a["idempotency_key"] == idem_key),
+                        None,
+                    )
+                    self._rows = [
+                        (
+                            ik["status"],
+                            ik.get("active_attempt_id"),
+                            ik.get("attempt_fence_version", 0),
+                            ik.get("expires_at"),
+                            bool(ik.get("expired", False)),
+                            att["status"] if att else None,
                         )
                     ]
             return
@@ -3494,6 +3517,529 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 cur.execute("DELETE FROM utda.audit_events WHERE event_id IN ('rls-ev-a', 'rls-ev-b', 'rls-ev-null', 'rls-ev-a-ok')")
                 cur.execute("DELETE FROM utda.projects WHERE project_id IN ('RLS_PROJ_A', 'RLS_PROJ_B')")
             mconn.commit()
+
+    def test_lease_config_validation_and_heartbeat_unit(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from engine.lease_heartbeat import LeaseConfig, LeaseConfigurationError, LeaseHeartbeat, LeaseLostError
+
+        # Valid configs & env parsing
+        cfg_default = LeaseConfig.from_env({})
+        self.assertEqual(cfg_default.lock_ttl_seconds, 180)
+        self.assertEqual(cfg_default.heartbeat_interval_seconds, 60.0)
+        cfg_custom = LeaseConfig.from_env(
+            {
+                "UTDA_LOCK_TTL_SECONDS": "30",
+                "UTDA_HEARTBEAT_INTERVAL_SECONDS": "10",
+                "UTDA_LEASE_SELF_FENCE_MARGIN_SECONDS": "5",
+            }
+        )
+        self.assertEqual(cfg_custom.lock_ttl_seconds, 30)
+        self.assertEqual(cfg_custom.heartbeat_interval_seconds, 10.0)
+        self.assertEqual(cfg_custom.self_fence_deadline_seconds, 25.0)
+
+        # Invalid interval / TTL / margin bounds fail closed
+        invalid_kwargs = [
+            {"lock_ttl_seconds": 0, "heartbeat_interval_seconds": 0.1},
+            {"lock_ttl_seconds": -5, "heartbeat_interval_seconds": 1.0},
+            {"lock_ttl_seconds": True, "heartbeat_interval_seconds": 1.0},
+            {"lock_ttl_seconds": 10, "heartbeat_interval_seconds": 0},
+            {"lock_ttl_seconds": 10, "heartbeat_interval_seconds": -1},
+            {"lock_ttl_seconds": 10, "heartbeat_interval_seconds": 5.0},
+            {"lock_ttl_seconds": 10, "heartbeat_interval_seconds": 8.0},
+            {"lock_ttl_seconds": 10, "heartbeat_interval_seconds": 4.0, "self_fence_margin_seconds": -1.0},
+            {"lock_ttl_seconds": 10, "heartbeat_interval_seconds": 4.0, "self_fence_margin_seconds": 6.5},
+            {"lock_ttl_seconds": 10, "heartbeat_interval_seconds": 4.0, "self_fence_margin_seconds": 10.0},
+        ]
+        for bad in invalid_kwargs:
+            with self.assertRaises(LeaseConfigurationError):
+                LeaseConfig(**bad)  # type: ignore[arg-type]
+        for bad_env in (
+            {"UTDA_LOCK_TTL_SECONDS": "abc"},
+            {"UTDA_HEARTBEAT_INTERVAL_SECONDS": "nan"},
+            {"UTDA_LOCK_TTL_SECONDS": "10", "UTDA_HEARTBEAT_INTERVAL_SECONDS": "5"},
+        ):
+            with self.assertRaises(LeaseConfigurationError):
+                LeaseConfig.from_env(bad_env)
+
+        unit_cfg = DatabaseConfig.from_env(
+            {"UTDA_DATABASE_URL": "postgresql://utda_runtime:secret-pw@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"}
+        )
+        state = _FakeDBState()
+        state.tables_initialized = True
+        pool = _FakePool(state)
+        with DatabaseManager(unit_cfg, pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+            repo = UTDADatabaseRepository(db)
+            idem = "hb-unit-key-1"
+            claim = repo.claim_idempotency_and_attempt(
+                idempotency_key=idem,
+                scope="phase2b4_check",
+                project_id="HB_UNIT_A",
+                feature_id="FEAT-HB",
+                report_blob_sha="blob-hb",
+                target_document_id="D06",
+                event_receipt_id=None,
+                lock_ttl_seconds=2,
+            )
+            att_id = claim["attempt_id"]
+            fence = claim["fence_version"]
+
+            # 1. Successful renewal (with and without explicit expected_fence_version)
+            r1 = repo.renew_attempt_lease(
+                project_id="HB_UNIT_A",
+                idempotency_key=idem,
+                attempt_id=att_id,
+                expected_fence_version=fence,
+                extend_ttl_seconds=5,
+            )
+            self.assertTrue(r1["renewed"])
+            r_opt = repo.renew_attempt_lease(
+                project_id="HB_UNIT_A",
+                idempotency_key=idem,
+                attempt_id=att_id,
+                expected_fence_version=None,
+                extend_ttl_seconds=5,
+            )
+            self.assertTrue(r_opt["renewed"])
+
+            # 2 & 4. Non-owner and another project rejected cleanly
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    project_id="HB_UNIT_A",
+                    idempotency_key=idem,
+                    attempt_id="wrong-attempt-id",
+                    expected_fence_version=fence,
+                    extend_ttl_seconds=5,
+                )
+            with self.assertRaises(IdempotencyIdentityMismatchError):
+                repo.renew_attempt_lease(
+                    project_id="HB_UNIT_B",
+                    idempotency_key=idem,
+                    attempt_id=att_id,
+                    expected_fence_version=fence,
+                    extend_ttl_seconds=5,
+                )
+
+            # 5. Concurrent renewals: active owner succeeds while stale competitors fail
+            def _race(i: int) -> str:
+                if i % 2 == 0:
+                    repo.renew_attempt_lease(
+                        project_id="HB_UNIT_A",
+                        idempotency_key=idem,
+                        attempt_id=att_id,
+                        expected_fence_version=fence,
+                        extend_ttl_seconds=5,
+                    )
+                    return "ok"
+                try:
+                    repo.renew_attempt_lease(
+                        project_id="HB_UNIT_A",
+                        idempotency_key=idem,
+                        attempt_id="other-att",
+                        expected_fence_version=fence,
+                        extend_ttl_seconds=5,
+                    )
+                    return "unexpected"
+                except StaleAttemptError:
+                    return "stale"
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                outcomes = list(ex.map(_race, range(4)))
+            self.assertEqual(sorted(outcomes), ["ok", "ok", "stale", "stale"])
+
+            # 6 & 7. Periodic renewal during active work & prompt termination on completion
+            fast_cfg = LeaseConfig(lock_ttl_seconds=2, heartbeat_interval_seconds=0.08, self_fence_margin_seconds=0.5)
+            with LeaseHeartbeat(
+                project_id="HB_UNIT_A",
+                idempotency_key=idem,
+                attempt_id=att_id,
+                expected_fence_version=fence,
+                renew_fn=repo.renew_attempt_lease,
+                config=fast_cfg,
+            ) as hb:
+                self.assertTrue(hb.is_running)
+                hb.wait_or_raise(0.26)
+                self.assertGreaterEqual(hb.renewal_count, 2)
+                self.assertFalse(hb.lost)
+            self.assertFalse(hb.is_running)
+
+            # 8. Heartbeat stops promptly on worker failure
+            hb_fail = LeaseHeartbeat(
+                project_id="HB_UNIT_A",
+                idempotency_key=idem,
+                attempt_id=att_id,
+                expected_fence_version=fence,
+                renew_fn=repo.renew_attempt_lease,
+                config=fast_cfg,
+            )
+            with self.assertRaises(RuntimeError):
+                with hb_fail:
+                    self.assertTrue(hb_fail.is_running)
+                    raise RuntimeError("worker crashed")
+            self.assertFalse(hb_fail.is_running)
+
+            # 3. Renewal fails & stops heartbeat after lease expiry
+            state.idempotency_keys[idem]["expired"] = True
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    project_id="HB_UNIT_A",
+                    idempotency_key=idem,
+                    attempt_id=att_id,
+                    expected_fence_version=fence,
+                    extend_ttl_seconds=5,
+                )
+            hb_exp = LeaseHeartbeat(
+                project_id="HB_UNIT_A",
+                idempotency_key=idem,
+                attempt_id=att_id,
+                expected_fence_version=fence,
+                renew_fn=repo.renew_attempt_lease,
+                config=fast_cfg,
+            )
+            with hb_exp:
+                self.assertTrue(hb_exp.abort_event.wait(timeout=2.0))
+                with self.assertRaises(LeaseLostError):
+                    hb_exp.raise_if_lost()
+            self.assertFalse(hb_exp.is_running)
+
+        # 9a. Ambiguous commit during renew_attempt_lease reconciles cleanly
+        state.idempotency_keys["hb-unit-key-1"]["expired"] = False
+        state.idempotency_keys["hb-unit-key-1"]["expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=1)
+        ambig_pool = _FakePool(state, fail_commit_times=1, commit_drops_after_apply=True)
+        with DatabaseManager(unit_cfg, pool_factory=lambda _c: ambig_pool, sleep_fn=lambda _s: None) as db_ambig:
+            repo_ambig = UTDADatabaseRepository(db_ambig)
+            rec_ren = repo_ambig.renew_attempt_lease(
+                project_id="HB_UNIT_A",
+                idempotency_key="hb-unit-key-1",
+                attempt_id=att_id,
+                expected_fence_version=fence,
+                extend_ttl_seconds=10,
+            )
+            self.assertTrue(rec_ren["renewed"])
+            self.assertTrue(rec_ren.get("reconciled"))
+
+        # 9b. Sustained DB outage triggers proactive self-fencing before lease TTL expires
+        dead_pool = _FakePool(state, fail_connect_times=999)
+        with DatabaseManager(unit_cfg, pool_factory=lambda _c: dead_pool, sleep_fn=lambda _s: None) as db_dead:
+            repo_dead = UTDADatabaseRepository(db_dead)
+            lost_callbacks: list[BaseException] = []
+            short_deadline_cfg = LeaseConfig(
+                lock_ttl_seconds=1,
+                heartbeat_interval_seconds=0.05,
+                self_fence_margin_seconds=0.75,
+            )
+            with LeaseHeartbeat(
+                project_id="HB_UNIT_A",
+                idempotency_key="hb-unit-key-1",
+                attempt_id=att_id,
+                expected_fence_version=fence,
+                renew_fn=repo_dead.renew_attempt_lease,
+                config=short_deadline_cfg,
+                on_lease_lost=lost_callbacks.append,
+            ) as hb_dead:
+                self.assertTrue(hb_dead.abort_event.wait(timeout=3.0))
+                self.assertGreaterEqual(hb_dead.transient_error_count, 1)
+                with self.assertRaises(LeaseLostError):
+                    hb_dead.raise_if_lost()
+            self.assertFalse(hb_dead.is_running)
+            self.assertEqual(len(lost_callbacks), 1)
+
+    @unittest.skipUnless(
+        os.getenv("UTDA_TEST_DATABASE_URL") and os.getenv("UTDA_TEST_RUNTIME_URL"),
+        "PG16 worker lease heartbeat tests require UTDA_TEST_DATABASE_URL & UTDA_TEST_RUNTIME_URL (runs in ci-database.yml)",
+    )
+    def test_real_postgres_worker_lease_heartbeat_and_renewal(self) -> None:
+        import psycopg
+        from engine.lease_heartbeat import LeaseConfig, LeaseHeartbeat, LeaseLostError
+
+        admin_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_DATABASE_URL")
+        runtime_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_RUNTIME_URL")
+        idem = "ci-pg16-lease-hb-key-1"
+
+        with DatabaseManager(runtime_cfg) as db:
+            repo = UTDADatabaseRepository(db)
+            repo.upsert_project(
+                project_id="HB_PROJ_A",
+                project_name="Heartbeat Project A",
+                status="active",
+                github_owner="UNAI-TECH",
+                github_repo="hb-proj-a",
+                default_branch="main",
+            )
+            repo.upsert_project(
+                project_id="HB_PROJ_B",
+                project_name="Heartbeat Project B",
+                status="active",
+                github_owner="UNAI-TECH",
+                github_repo="hb-proj-b",
+                default_branch="main",
+            )
+            claim = repo.claim_idempotency_and_attempt(
+                idempotency_key=idem,
+                scope="phase2b4_lease",
+                project_id="HB_PROJ_A",
+                feature_id="FEAT-HB-PG16",
+                report_blob_sha="blob-hb-pg16",
+                target_document_id="D06",
+                event_receipt_id=None,
+                lock_ttl_seconds=2,
+            )
+            self.assertTrue(claim["claimed"])
+            att1_id = claim["attempt_id"]
+            fence1 = claim["fence_version"]
+
+            with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as chk:
+                with chk.cursor() as cur:
+                    cur.execute("SELECT set_config('utda.current_project_id', 'HB_PROJ_A', true)")
+                    cur.execute("SELECT expires_at FROM utda.idempotency_keys WHERE idempotency_key = %s", (idem,))
+                    exp_initial = cur.fetchone()[0]
+
+            # 1, 6 & 7: Successful periodic renewals during work + prompt exit on completion
+            hb_cfg = LeaseConfig(lock_ttl_seconds=2, heartbeat_interval_seconds=0.35, self_fence_margin_seconds=0.4)
+            with LeaseHeartbeat(
+                project_id="HB_PROJ_A",
+                idempotency_key=idem,
+                attempt_id=att1_id,
+                expected_fence_version=fence1,
+                renew_fn=repo.renew_attempt_lease,
+                config=hb_cfg,
+            ) as hb:
+                self.assertTrue(hb.is_running)
+                hb.wait_or_raise(0.95)
+                self.assertGreaterEqual(hb.renewal_count, 2)
+                self.assertFalse(hb.lost)
+            self.assertFalse(hb.is_running)
+
+            with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as chk:
+                with chk.cursor() as cur:
+                    cur.execute("SELECT set_config('utda.current_project_id', 'HB_PROJ_A', true)")
+                    cur.execute(
+                        "SELECT expires_at, attempt_fence_version FROM utda.idempotency_keys WHERE idempotency_key = %s",
+                        (idem,),
+                    )
+                    exp_after, ver_after = cur.fetchone()
+                    self.assertGreater(exp_after, exp_initial)
+                    self.assertEqual(ver_after, 1)
+
+            # 1b: Optional expected_fence_version=None still enforces project, active_attempt_id & expiry
+            ren_opt = repo.renew_attempt_lease(
+                project_id="HB_PROJ_A",
+                idempotency_key=idem,
+                attempt_id=att1_id,
+                expected_fence_version=None,
+                extend_ttl_seconds=4,
+            )
+            self.assertTrue(ren_opt["renewed"])
+
+            # 2 & 4: Non-owner and another project rejected cleanly under PG16 + RLS
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    project_id="HB_PROJ_A",
+                    idempotency_key=idem,
+                    attempt_id="non-owner-att",
+                    expected_fence_version=fence1,
+                    extend_ttl_seconds=4,
+                )
+            # Under 0005 RLS, HB_PROJ_B cannot even see HB_PROJ_A's key -> StaleAttemptError
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    project_id="HB_PROJ_B",
+                    idempotency_key=idem,
+                    attempt_id=att1_id,
+                    expected_fence_version=fence1,
+                    extend_ttl_seconds=4,
+                )
+            with LeaseHeartbeat(
+                project_id="HB_PROJ_B",
+                idempotency_key=idem,
+                attempt_id=att1_id,
+                expected_fence_version=fence1,
+                renew_fn=repo.renew_attempt_lease,
+                config=hb_cfg,
+            ) as hb_wrong_proj:
+                self.assertTrue(hb_wrong_proj.abort_event.wait(timeout=2.0))
+                with self.assertRaises(LeaseLostError):
+                    hb_wrong_proj.raise_if_lost()
+            self.assertFalse(hb_wrong_proj.is_running)
+
+            # 5: Concurrent renewals on real PG16
+            def _pg_race(idx: int) -> str:
+                if idx % 2 == 0:
+                    res = repo.renew_attempt_lease(
+                        project_id="HB_PROJ_A",
+                        idempotency_key=idem,
+                        attempt_id=att1_id,
+                        expected_fence_version=fence1,
+                        extend_ttl_seconds=4,
+                    )
+                    return f"ok:{res['fence_version']}"
+                try:
+                    repo.renew_attempt_lease(
+                        project_id="HB_PROJ_A",
+                        idempotency_key=idem,
+                        attempt_id="stale-racer",
+                        expected_fence_version=fence1,
+                        extend_ttl_seconds=4,
+                    )
+                    return "unexpected"
+                except StaleAttemptError:
+                    return "rejected"
+
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                pg_race_res = list(ex.map(_pg_race, range(6)))
+            self.assertEqual(sorted(pg_race_res), ["ok:1", "ok:1", "ok:1", "rejected", "rejected", "rejected"])
+
+            # 8: Worker exception cleanly terminates heartbeat thread on PG16
+            hb_worker_err = LeaseHeartbeat(
+                project_id="HB_PROJ_A",
+                idempotency_key=idem,
+                attempt_id=att1_id,
+                expected_fence_version=fence1,
+                renew_fn=repo.renew_attempt_lease,
+                config=hb_cfg,
+            )
+            with self.assertRaises(RuntimeError):
+                with hb_worker_err:
+                    self.assertTrue(hb_worker_err.is_running)
+                    raise RuntimeError("PG16 worker boom")
+            self.assertFalse(hb_worker_err.is_running)
+
+            # 9a: Ambiguous commit on renew_attempt_lease reconciles cleanly against PG16
+            orig_conn_fn = db._pool.connection
+
+            class _DropOnceRenewConnProxy:
+                def __init__(self, inner) -> None:
+                    self._inner = inner
+                    self._dropped = False
+
+                def cursor(self, *args, **kwargs):
+                    return self._inner.cursor(*args, **kwargs)
+
+                def rollback(self):
+                    return self._inner.rollback()
+
+                def commit(self):
+                    self._inner.commit()
+                    if not self._dropped:
+                        self._dropped = True
+                        raise psycopg.OperationalError("Simulated PG16 post-commit socket drop during renewal")
+
+            armed = {"flag": True}
+            from contextlib import contextmanager as _cm
+
+            @_cm
+            def _drop_renew_conn(timeout: float = 10.0):
+                with orig_conn_fn(timeout=timeout) as real_conn:
+                    if armed["flag"]:
+                        armed["flag"] = False
+                        yield _DropOnceRenewConnProxy(real_conn)
+                    else:
+                        yield real_conn
+
+            db._pool.connection = _drop_renew_conn  # type: ignore[method-assign]
+            try:
+                rec_pg_ren = repo.renew_attempt_lease(
+                    project_id="HB_PROJ_A",
+                    idempotency_key=idem,
+                    attempt_id=att1_id,
+                    expected_fence_version=fence1,
+                    extend_ttl_seconds=5,
+                )
+                self.assertTrue(rec_pg_ren["renewed"])
+                self.assertTrue(rec_pg_ren.get("reconciled"))
+            finally:
+                db._pool.connection = orig_conn_fn  # type: ignore[method-assign]
+
+            # 3: Expiry rejects renewal, stops heartbeat, and enables recovery claim -> attempt 2
+            with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as aconn:
+                with aconn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE utda.idempotency_keys SET expires_at = NOW() - INTERVAL '5 seconds' WHERE idempotency_key = %s",
+                        (idem,),
+                    )
+                aconn.commit()
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    project_id="HB_PROJ_A",
+                    idempotency_key=idem,
+                    attempt_id=att1_id,
+                    expected_fence_version=fence1,
+                    extend_ttl_seconds=4,
+                )
+            with LeaseHeartbeat(
+                project_id="HB_PROJ_A",
+                idempotency_key=idem,
+                attempt_id=att1_id,
+                expected_fence_version=fence1,
+                renew_fn=repo.renew_attempt_lease,
+                config=hb_cfg,
+            ) as hb_expired:
+                self.assertTrue(hb_expired.abort_event.wait(timeout=2.0))
+                with self.assertRaises(LeaseLostError):
+                    hb_expired.raise_if_lost()
+            self.assertFalse(hb_expired.is_running)
+
+            claim2 = repo.claim_idempotency_and_attempt(
+                idempotency_key=idem,
+                scope="phase2b4_lease",
+                project_id="HB_PROJ_A",
+                feature_id="FEAT-HB-PG16",
+                report_blob_sha="blob-hb-pg16",
+                target_document_id="D06",
+                event_receipt_id=None,
+                lock_ttl_seconds=5,
+            )
+            self.assertTrue(claim2["claimed"])
+            self.assertEqual(claim2["attempt_number"], 2)
+            self.assertEqual(claim2["fence_version"], 2)
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    project_id="HB_PROJ_A",
+                    idempotency_key=idem,
+                    attempt_id=att1_id,
+                    expected_fence_version=1,
+                    extend_ttl_seconds=5,
+                )
+            repo.finalize_processing_attempt(
+                project_id="HB_PROJ_A",
+                event_receipt_id=None,
+                idempotency_key=idem,
+                attempt_id=claim2["attempt_id"],
+                expected_fence_version=2,
+                attempt_status="SUCCEEDED",
+                final_key_status="COMPLETED",
+                result_summary={"ok": True},
+            )
+
+        # 9b: Unreachable DB connection during heartbeat triggers proactive self-fence
+        broken_cfg = DatabaseConfig.from_env(
+            {
+                "UTDA_DATABASE_URL": "postgresql://utda_runtime:bad@127.0.0.1:1/utda_none",
+                "UTDA_DATABASE_SSLMODE": "disable",
+                "UTDA_ALLOW_INSECURE_LOCAL_DB": "true",
+                "UTDA_DATABASE_CONNECT_TIMEOUT": "1",
+                "UTDA_DATABASE_MAX_RETRIES": "0",
+            }
+        )
+        with DatabaseManager(broken_cfg) as broken_db:
+            broken_repo = UTDADatabaseRepository(broken_db)
+            self_fence_cfg = LeaseConfig(
+                lock_ttl_seconds=1,
+                heartbeat_interval_seconds=0.05,
+                self_fence_margin_seconds=0.75,
+            )
+            with LeaseHeartbeat(
+                project_id="HB_PROJ_A",
+                idempotency_key=idem,
+                attempt_id="broken-att",
+                expected_fence_version=2,
+                renew_fn=broken_repo.renew_attempt_lease,
+                config=self_fence_cfg,
+            ) as hb_conn_err:
+                self.assertTrue(hb_conn_err.abort_event.wait(timeout=4.0))
+                self.assertGreaterEqual(hb_conn_err.transient_error_count, 1)
+                with self.assertRaises(LeaseLostError):
+                    hb_conn_err.raise_if_lost()
+            self.assertFalse(hb_conn_err.is_running)
 
     @unittest.skipUnless(
         os.getenv("UTDA_RUN_LIVE_SUPABASE_TESTS") == "true" and os.getenv("UTDA_DATABASE_URL"),

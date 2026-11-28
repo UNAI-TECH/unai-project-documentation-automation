@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from engine.audit_store import AuditStore, make_event_key, make_idempotency_key
 from engine.config_loader import (
@@ -23,7 +23,7 @@ from engine.config_loader import (
     resolve_project,
 )
 from engine.contracts import AUTHORITY_MODE, MASTER_RECORD_SCOPE
-from engine.database import DatabaseManager, UTDADatabaseRepository
+from engine.database import DatabaseManager, StaleAttemptError, UTDADatabaseRepository
 from engine.db_config import DatabaseConfig, DatabaseConfigError
 from engine.github_reader import (
     GitEvidenceError,
@@ -31,6 +31,7 @@ from engine.github_reader import (
     read_git_evidence,
     validate_git_sha,
 )
+from engine.lease_heartbeat import LeaseConfig, LeaseHeartbeat, LeaseLostError
 from engine.report_parser import locate_and_parse_report
 from engine.sanitization import sanitize_log_text
 
@@ -184,6 +185,8 @@ def process_event(
     repo_dir: Path,
     utda_dir: Path,
     audit: AuditStore,
+    lease_config: LeaseConfig | None = None,
+    on_claimed_work: Callable[[LeaseHeartbeat], None] | None = None,
 ) -> dict[str, Any]:
     """Execute Phase 1 correlation, validation, persistence, and idempotency checks."""
     if event.event_name == "pull_request" and not event.pr_merged:
@@ -356,11 +359,12 @@ def process_event(
         audit.export_artifact("audit_record.json", result)
         return result
 
+    active_lease_config = lease_config or LeaseConfig.from_env()
     event_key = make_event_key(event.repository, feature_id, report_blob_sha or "local-sha")
     idem_key = make_idempotency_key(
         event.repository, feature_id, report_blob_sha or "local-sha", "PHASE1_CORRELATION"
     )
-    claimed, attempt_no, attempt_id = audit.claim_processing_lock(
+    lease = audit.claim_processing_lease(
         idempotency_key=idem_key,
         scope="phase1_correlation",
         project_id=project_id,
@@ -368,8 +372,9 @@ def process_event(
         report_blob_sha=report_blob_sha or "local-sha",
         target_document_id="PHASE1_CORRELATION",
         event_receipt_id=receipt["receipt_id"],
+        lock_ttl_seconds=active_lease_config.lock_ttl_seconds,
     )
-    if not claimed or not attempt_id:
+    if not lease.claimed or not lease.attempt_id:
         result = {
             "status": "SKIPPED_DUPLICATE",
             "project_id": project_id,
@@ -382,27 +387,44 @@ def process_event(
         return result
 
     finalized = False
+    heartbeat_ref: LeaseHeartbeat | None = None
     try:
-        audit.record_attempt_outcome(
+        with audit.lease_heartbeat(
             project_id=project_id,
-            event_receipt_id=receipt["receipt_id"],
             idempotency_key=idem_key,
-            attempt_id=attempt_id,
-            attempt_number=attempt_no,
-            succeeded=True,
-            final_key_status="COMPLETED",
-            result_summary={"phase": 1, "dry_run": True, "report_path": parsed.report_path},
-        )
-        finalized = True
+            attempt_id=lease.attempt_id,
+            expected_fence_version=lease.fence_version,
+            config=active_lease_config,
+        ) as heartbeat:
+            heartbeat_ref = heartbeat
+            if on_claimed_work is not None:
+                on_claimed_work(heartbeat)
+            heartbeat.raise_if_lost()
+            audit.record_attempt_outcome(
+                project_id=project_id,
+                event_receipt_id=receipt["receipt_id"],
+                idempotency_key=idem_key,
+                attempt_id=lease.attempt_id,
+                attempt_number=lease.attempt_number,
+                expected_fence_version=lease.fence_version,
+                succeeded=True,
+                final_key_status="COMPLETED",
+                result_summary={"phase": 1, "dry_run": True, "report_path": parsed.report_path},
+            )
+            finalized = True
     except Exception as exc:
-        if not finalized:
+        lease_lost = isinstance(exc, (LeaseLostError, StaleAttemptError)) or (
+            heartbeat_ref is not None and heartbeat_ref.lost
+        )
+        if not finalized and not lease_lost:
             try:
                 audit.record_attempt_outcome(
                     project_id=project_id,
                     event_receipt_id=receipt["receipt_id"],
                     idempotency_key=idem_key,
-                    attempt_id=attempt_id,
-                    attempt_number=attempt_no,
+                    attempt_id=lease.attempt_id,
+                    attempt_number=lease.attempt_number,
+                    expected_fence_version=lease.fence_version,
                     succeeded=False,
                     final_key_status="FAILED",
                     retry_state="RETRY_SCHEDULED",

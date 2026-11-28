@@ -984,15 +984,24 @@ class UTDADatabaseRepository:
         project_id: str,
         idempotency_key: str,
         attempt_id: str,
-        expected_fence_version: int,
+        expected_fence_version: int | None = None,
         extend_ttl_seconds: int = 900,
     ) -> dict[str, Any]:
-        """Atomically extend lease expiry when project_id, active_attempt_id, and fence match."""
+        """Atomically extend lease expiry when project_id, ownership, and optional fence match."""
         pid = validate_project_id(project_id)
+        if not idempotency_key or not str(idempotency_key).strip():
+            raise StaleAttemptError("idempotency_key is required to renew a processing lease.")
         if not attempt_id or not str(attempt_id).strip():
             raise StaleAttemptError("attempt_id is required to renew a processing lease.")
-        if extend_ttl_seconds <= 0:
-            raise ValueError("extend_ttl_seconds must be positive.")
+        if isinstance(extend_ttl_seconds, bool) or int(extend_ttl_seconds) <= 0:
+            raise ValueError("extend_ttl_seconds must be a positive integer.")
+        ttl_seconds = int(extend_ttl_seconds)
+
+        expected_ver: int | None = None
+        if expected_fence_version is not None:
+            if isinstance(expected_fence_version, bool) or int(expected_fence_version) < 0:
+                raise StaleAttemptError("expected_fence_version must be a non-negative integer.")
+            expected_ver = int(expected_fence_version)
 
         keys_tbl = self._tbl("idempotency_keys")
         attempts_tbl = self._tbl("processing_attempts")
@@ -1013,6 +1022,7 @@ class UTDADatabaseRepository:
               AND attempt_fence_version = %s
             RETURNING expires_at, attempt_fence_version
         """
+        observed_target_exp: list[Any] = []
 
         def _op(conn: Any) -> dict[str, Any]:
             with conn.cursor() as cur:
@@ -1035,9 +1045,10 @@ class UTDADatabaseRepository:
                     raise StaleAttemptError(
                         f"Stale worker '{attempt_id}' cannot renew; active attempt is '{active_attempt_id}'."
                     )
-                if int(row_fence_ver or 0) != int(expected_fence_version):
+                effective_fence = int(row_fence_ver or 0)
+                if expected_ver is not None and effective_fence != expected_ver:
                     raise StaleAttemptError(
-                        f"Stale fence version {expected_fence_version} cannot renew; current version is {row_fence_ver}."
+                        f"Stale fence version {expected_ver} cannot renew; current version is {row_fence_ver}."
                     )
                 if is_expired:
                     raise StaleAttemptError(
@@ -1056,13 +1067,14 @@ class UTDADatabaseRepository:
 
                 cur.execute(
                     renew_sql,
-                    (extend_ttl_seconds, idempotency_key, pid, attempt_id, expected_fence_version),
+                    (ttl_seconds, idempotency_key, pid, attempt_id, effective_fence),
                 )
                 upd = cur.fetchone()
                 if upd is None:
                     raise StaleAttemptError(
                         f"Lease renewal rejected for attempt '{attempt_id}'."
                     )
+                observed_target_exp[:] = [upd[0]]
                 return {
                     "renewed": True,
                     "idempotency_key": idempotency_key,
@@ -1071,7 +1083,59 @@ class UTDADatabaseRepository:
                     "expires_at": upd[0].isoformat() if hasattr(upd[0], "isoformat") else str(upd[0]),
                 }
 
-        return self.db.run_in_project_transaction(pid, _op)
+        try:
+            return self.db.run_in_project_transaction(pid, _op)
+        except CommitOutcomeUnknownError:
+            def _reconcile(conn: Any) -> dict[str, Any] | None:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT ik.status, ik.active_attempt_id, ik.attempt_fence_version,
+                               ik.expires_at,
+                               (ik.expires_at IS NOT NULL AND ik.expires_at < NOW()) AS is_expired,
+                               pa.status
+                        FROM {keys_tbl} ik
+                        LEFT JOIN {attempts_tbl} pa
+                          ON pa.idempotency_key = ik.idempotency_key AND pa.attempt_id = %s
+                        WHERE ik.idempotency_key = %s AND ik.project_id = %s
+                        """,
+                        (attempt_id, idempotency_key, pid),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    return {
+                        "key_status": row[0],
+                        "active_attempt_id": row[1],
+                        "fence_version": int(row[2] or 0),
+                        "expires_at": row[3],
+                        "is_expired": bool(row[4]),
+                        "att_status": row[5],
+                    }
+
+            state = self.db.run_project_readonly(pid, _reconcile)
+            if (
+                state is None
+                or state["key_status"] != "IN_PROGRESS"
+                or state["active_attempt_id"] != attempt_id
+                or state["att_status"] != "IN_PROGRESS"
+                or state["is_expired"]
+                or (expected_ver is not None and state["fence_version"] != expected_ver)
+            ):
+                raise StaleAttemptError(
+                    f"Lease renewal for attempt '{attempt_id}' rejected after ambiguous commit reconciliation."
+                )
+            reconciled_exp = state["expires_at"]
+            if observed_target_exp and reconciled_exp is not None and reconciled_exp >= observed_target_exp[0]:
+                return {
+                    "renewed": True,
+                    "idempotency_key": idempotency_key,
+                    "attempt_id": attempt_id,
+                    "fence_version": state["fence_version"],
+                    "expires_at": reconciled_exp.isoformat() if hasattr(reconciled_exp, "isoformat") else str(reconciled_exp),
+                    "reconciled": True,
+                }
+            return self.db.run_in_project_transaction(pid, _op)
 
     def acquire_idempotency_key(
         self,

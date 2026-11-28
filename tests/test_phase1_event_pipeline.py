@@ -34,6 +34,7 @@ from engine.github_reader import (
     validate_git_sha,
 )
 from engine.migrations.runner import apply_migrations
+from engine.lease_heartbeat import LeaseConfig, LeaseHeartbeat, LeaseLostError
 from engine.trigger import normalize_event, process_event
 from tests.test_database_phase1 import _FakeDBState, _FakePool
 
@@ -1323,6 +1324,320 @@ class Phase1EventPipelineTests(unittest.TestCase):
                 with self.assertRaises(ProjectIdentityError):
                     process_event(ev_disp, repo_dir=repo, utda_dir=utda, audit=audit_disp)
             _assert_zero_db_writes(state_disp, pool_disp)
+
+    def test_process_event_heartbeat_renewal_completion_failure_and_lease_loss(self) -> None:
+        from engine.database import StaleAttemptError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _init_temp_git_repo(base)
+            utda = _init_temp_utda_dir(base)
+
+            # 1. Normal completion with active heartbeat renewals + clean shutdown
+            state_ok = _FakeDBState()
+            state_ok.tables_initialized = True
+            pool_ok = _FakePool(state_ok)
+            sha_ok = _commit_json_report(
+                repo,
+                "FEAT-HB-OK",
+                {
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-HB-OK",
+                    "feature_name": "Heartbeat Success",
+                    "change_type": "bug_fix",
+                    "summary": "Heartbeat renews during processing and exits on completion.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "hb-ok"}],
+                },
+            )
+            blob_ok = compute_blob_sha(repo, "documentation/reports/final/FEAT-HB-OK.json", git_sha=sha_ok)
+            idem_ok = make_idempotency_key("UNAI-TECH/pilot-app", "FEAT-HB-OK", blob_ok, "PHASE1_CORRELATION")
+            fast_cfg = LeaseConfig(lock_ttl_seconds=2, heartbeat_interval_seconds=0.08, self_fence_margin_seconds=0.5)
+            observed_hb: list[LeaseHeartbeat] = []
+
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool_ok, sleep_fn=lambda _s: None) as db:
+                audit_ok = AuditStore(repo=UTDADatabaseRepository(db))
+                ev_ok = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": sha_ok,
+                        "PR_NUMBER": "601",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-HB-OK",
+                        "UTDA_DELIVERY_ID": "deliv-hb-ok",
+                    }
+                )
+
+                def _work_ok(hb: LeaseHeartbeat) -> None:
+                    observed_hb.append(hb)
+                    self.assertTrue(hb.is_running)
+                    hb.wait_or_raise(0.26)
+                    self.assertGreaterEqual(hb.renewal_count, 2)
+
+                res_ok = process_event(
+                    ev_ok,
+                    repo_dir=repo,
+                    utda_dir=utda,
+                    audit=audit_ok,
+                    lease_config=fast_cfg,
+                    on_claimed_work=_work_ok,
+                )
+            self.assertEqual(res_ok["status"], "DRY_RUN_READY")
+            self.assertEqual(len(observed_hb), 1)
+            self.assertFalse(observed_hb[0].is_running)
+            self.assertGreaterEqual(observed_hb[0].renewal_count, 2)
+            self.assertEqual(state_ok.idempotency_keys[idem_ok]["status"], "COMPLETED")
+            self.assertEqual(state_ok.idempotency_keys[idem_ok]["attempt_fence_version"], 1)
+
+            # 2. Worker failure cleanly terminates heartbeat & marks attempt FAILED (RETRY_SCHEDULED)
+            state_err = _FakeDBState()
+            state_err.tables_initialized = True
+            pool_err = _FakePool(state_err)
+            hb_err_ref: list[LeaseHeartbeat] = []
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool_err, sleep_fn=lambda _s: None) as db:
+                audit_err = AuditStore(repo=UTDADatabaseRepository(db))
+                ev_err = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": sha_ok,
+                        "PR_NUMBER": "602",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-HB-OK",
+                        "UTDA_DELIVERY_ID": "deliv-hb-err",
+                    }
+                )
+
+                def _work_fail(hb: LeaseHeartbeat) -> None:
+                    hb_err_ref.append(hb)
+                    hb.wait_or_raise(0.10)
+                    raise RuntimeError("Simulated worker processing exception")
+
+                with self.assertRaises(RuntimeError):
+                    process_event(
+                        ev_err,
+                        repo_dir=repo,
+                        utda_dir=utda,
+                        audit=audit_err,
+                        lease_config=fast_cfg,
+                        on_claimed_work=_work_fail,
+                    )
+            self.assertEqual(len(hb_err_ref), 1)
+            self.assertFalse(hb_err_ref[0].is_running)
+            self.assertEqual(state_err.idempotency_keys[idem_ok]["status"], "FAILED")
+            self.assertEqual(state_err.attempts[0]["retry_state"], "RETRY_SCHEDULED")
+
+            # 3. Mid-processing lease loss aborts worker without corrupting new owner's active attempt
+            state_lost = _FakeDBState()
+            state_lost.tables_initialized = True
+            pool_lost = _FakePool(state_lost)
+            hb_lost_ref: list[LeaseHeartbeat] = []
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool_lost, sleep_fn=lambda _s: None) as db:
+                audit_lost = AuditStore(repo=UTDADatabaseRepository(db))
+                ev_lost = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": sha_ok,
+                        "PR_NUMBER": "603",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-HB-OK",
+                        "UTDA_DELIVERY_ID": "deliv-hb-lost",
+                    }
+                )
+
+                def _work_lose_lease(hb: LeaseHeartbeat) -> None:
+                    hb_lost_ref.append(hb)
+                    # Simulate another worker stealing the lease after expiry
+                    with state_lost.lock:
+                        state_lost.idempotency_keys[idem_ok]["active_attempt_id"] = "winner-attempt-2"
+                        state_lost.idempotency_keys[idem_ok]["attempt_fence_version"] = 2
+                    hb.wait_or_raise(2.0)
+
+                with self.assertRaises(LeaseLostError):
+                    process_event(
+                        ev_lost,
+                        repo_dir=repo,
+                        utda_dir=utda,
+                        audit=audit_lost,
+                        lease_config=fast_cfg,
+                        on_claimed_work=_work_lose_lease,
+                    )
+            self.assertEqual(len(hb_lost_ref), 1)
+            self.assertFalse(hb_lost_ref[0].is_running)
+            self.assertTrue(hb_lost_ref[0].lost)
+            self.assertIsInstance(hb_lost_ref[0].loss_reason, StaleAttemptError)
+            self.assertEqual(state_lost.idempotency_keys[idem_ok]["status"], "IN_PROGRESS")
+            self.assertEqual(state_lost.idempotency_keys[idem_ok]["active_attempt_id"], "winner-attempt-2")
+            self.assertEqual(state_lost.idempotency_keys[idem_ok]["attempt_fence_version"], 2)
+
+    @unittest.skipUnless(
+        os.getenv("UTDA_TEST_RUNTIME_URL") and os.getenv("UTDA_TEST_DATABASE_URL"),
+        "PG16 pipeline heartbeat lifecycle tests require CI role DSNs (runs in ci-database.yml)",
+    )
+    def test_real_postgres_process_event_heartbeat_lifecycle(self) -> None:
+        import psycopg
+
+        runtime_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_RUNTIME_URL")
+        admin_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_DATABASE_URL")
+        hb_cfg = LeaseConfig(lock_ttl_seconds=2, heartbeat_interval_seconds=0.35, self_fence_margin_seconds=0.4)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _init_temp_git_repo(base)
+            utda = _init_temp_utda_dir(base)
+
+            sha = _commit_json_report(
+                repo,
+                "FEAT-PG-HB1",
+                {
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-PG-HB1",
+                    "feature_name": "PG16 Heartbeat Lifecycle",
+                    "change_type": "database_change",
+                    "summary": "Verify PG16 process_event heartbeat renewals and shutdown.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "pg16-hb"}],
+                },
+            )
+            blob = compute_blob_sha(repo, "documentation/reports/final/FEAT-PG-HB1.json", git_sha=sha)
+            idem = make_idempotency_key("UNAI-TECH/pilot-app", "FEAT-PG-HB1", blob, "PHASE1_CORRELATION")
+
+            with DatabaseManager(runtime_cfg) as db:
+                audit = AuditStore(repo=UTDADatabaseRepository(db), artifacts_dir=base / "artifacts")
+                hb_refs: list[LeaseHeartbeat] = []
+                ev = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": sha,
+                        "PR_NUMBER": "651",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-PG-HB1",
+                        "UTDA_DELIVERY_ID": "pg-hb-deliv-1",
+                    }
+                )
+
+                def _pg_work(hb: LeaseHeartbeat) -> None:
+                    hb_refs.append(hb)
+                    self.assertTrue(hb.is_running)
+                    hb.wait_or_raise(0.95)
+                    self.assertGreaterEqual(hb.renewal_count, 2)
+
+                res = process_event(
+                    ev,
+                    repo_dir=repo,
+                    utda_dir=utda,
+                    audit=audit,
+                    lease_config=hb_cfg,
+                    on_claimed_work=_pg_work,
+                )
+                self.assertEqual(res["status"], "DRY_RUN_READY")
+                self.assertFalse(hb_refs[0].is_running)
+
+                # Worker failure stops heartbeat & marks attempt FAILED
+                sha_fail = _commit_json_report(
+                    repo,
+                    "FEAT-PG-HB2",
+                    {
+                        "project_id": "UTDA_PILOT",
+                        "feature_id": "FEAT-PG-HB2",
+                        "feature_name": "PG16 Heartbeat Failure",
+                        "change_type": "bug_fix",
+                        "summary": "Verify PG16 heartbeat stops on worker exception.",
+                        "implementation_status": "implemented",
+                        "evidence": [{"kind": "commit", "reference": "pg16-hb2"}],
+                    },
+                )
+                blob_fail = compute_blob_sha(repo, "documentation/reports/final/FEAT-PG-HB2.json", git_sha=sha_fail)
+                idem_fail = make_idempotency_key("UNAI-TECH/pilot-app", "FEAT-PG-HB2", blob_fail, "PHASE1_CORRELATION")
+                hb_fail_refs: list[LeaseHeartbeat] = []
+                ev_fail = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": sha_fail,
+                        "PR_NUMBER": "652",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-PG-HB2",
+                        "UTDA_DELIVERY_ID": "pg-hb-deliv-2",
+                    }
+                )
+
+                def _pg_fail(hb: LeaseHeartbeat) -> None:
+                    hb_fail_refs.append(hb)
+                    hb.wait_or_raise(0.45)
+                    raise RuntimeError("PG16 worker failure during leased work")
+
+                with self.assertRaises(RuntimeError):
+                    process_event(
+                        ev_fail,
+                        repo_dir=repo,
+                        utda_dir=utda,
+                        audit=audit,
+                        lease_config=hb_cfg,
+                        on_claimed_work=_pg_fail,
+                    )
+                self.assertFalse(hb_fail_refs[0].is_running)
+
+                # Worker stops processing when lease is superseded/expired in PG16
+                hb_stolen_refs: list[LeaseHeartbeat] = []
+                ev_stolen = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "pull_request",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": sha_fail,
+                        "PR_NUMBER": "652",
+                        "UTDA_PR_MERGED": "true",
+                        "FEATURE_ID": "FEAT-PG-HB2",
+                        "UTDA_DELIVERY_ID": "pg-hb-deliv-3",
+                    }
+                )
+
+                def _pg_stolen(hb: LeaseHeartbeat) -> None:
+                    hb_stolen_refs.append(hb)
+                    with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as aconn:
+                        with aconn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE utda.idempotency_keys SET expires_at = NOW() - INTERVAL '5 seconds' WHERE idempotency_key = %s",
+                                (idem_fail,),
+                            )
+                        aconn.commit()
+                    audit.claim_processing_lease(
+                        idempotency_key=idem_fail,
+                        scope="phase1_correlation",
+                        project_id="UTDA_PILOT",
+                        feature_id="FEAT-PG-HB2",
+                        report_blob_sha=blob_fail,
+                        target_document_id="PHASE1_CORRELATION",
+                        event_receipt_id=None,
+                        lock_ttl_seconds=5,
+                    )
+                    hb.wait_or_raise(2.0)
+
+                with self.assertRaises(LeaseLostError):
+                    process_event(
+                        ev_stolen,
+                        repo_dir=repo,
+                        utda_dir=utda,
+                        audit=audit,
+                        lease_config=hb_cfg,
+                        on_claimed_work=_pg_stolen,
+                    )
+                self.assertFalse(hb_stolen_refs[0].is_running)
+                self.assertTrue(hb_stolen_refs[0].lost)
+
+            with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as chk:
+                with chk.cursor() as cur:
+                    cur.execute("SELECT set_config('utda.current_project_id', 'UTDA_PILOT', true)")
+                    cur.execute("SELECT status, attempt_fence_version FROM utda.idempotency_keys WHERE idempotency_key = %s", (idem,))
+                    self.assertEqual(cur.fetchone(), ("COMPLETED", 1))
+                    cur.execute(
+                        "SELECT status, attempt_fence_version FROM utda.idempotency_keys WHERE idempotency_key = %s",
+                        (idem_fail,),
+                    )
+                    self.assertEqual(cur.fetchone(), ("IN_PROGRESS", 3))
 
 
 if __name__ == "__main__":
