@@ -738,34 +738,49 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
         state = _FakeDBState()
         cfg = self._cfg()
         discovered = discover_migrations(MIGRATIONS_DIR)
-        self.assertEqual([m.version for m in discovered], ["0001", "0002", "0003"])
+        self.assertEqual([m.version for m in discovered], ["0001", "0002", "0003", "0004"])
+        orig_0003 = next(m for m in discovered if m.version == "0003")
+        self.assertEqual(
+            orig_0003.checksum_sha256,
+            "0161daaebb55dec4f6f1f600f5c76ca4dcd0e5e3abab2c392b5ab6f18c6d6d1b",
+        )
 
         # Plan on empty DB shows all pending
         plan = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=True, connect_fn=lambda _c: _FakeConnection(state))
         self.assertEqual(
             plan["pending"],
-            ["0001_initial_utda_schema", "0002_roles_and_indexes", "0003_idempotency_fencing"],
+            [
+                "0001_initial_utda_schema",
+                "0002_roles_and_indexes",
+                "0003_idempotency_fencing",
+                "0004_idempotency_fence_version_hardening",
+            ],
         )
 
         # Apply from empty DB
         res1 = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False, connect_fn=lambda _c: _FakeConnection(state))
         self.assertEqual(
             res1["applied"],
-            ["0001_initial_utda_schema", "0002_roles_and_indexes", "0003_idempotency_fencing"],
+            [
+                "0001_initial_utda_schema",
+                "0002_roles_and_indexes",
+                "0003_idempotency_fencing",
+                "0004_idempotency_fence_version_hardening",
+            ],
         )
 
         # Re-running is safe / no pending migrations
         res2 = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False, connect_fn=lambda _c: _FakeConnection(state))
         self.assertEqual(res2["applied"], [])
 
-        # Simulate upgrade with a 0004 migration in a temp directory + failure rollback
+        # Simulate upgrade with a 0005 migration in a temp directory + failure rollback
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             for m in discovered:
                 (tmp_dir / m.path.name).write_text(m.sql, encoding="utf-8")
-            (tmp_dir / "0004_add_sample.sql").write_text("SELECT 1;", encoding="utf-8")
+            (tmp_dir / "0005_add_sample.sql").write_text("SELECT 1;", encoding="utf-8")
             res3 = apply_migrations(cfg, tmp_dir, dry_run=False, connect_fn=lambda _c: _FakeConnection(state))
-            self.assertEqual(res3["applied"], ["0004_add_sample"])
+            self.assertEqual(res3["applied"], ["0005_add_sample"])
 
             # Altering already-applied 0001 raises checksum mismatch
             (tmp_dir / "0001_initial_utda_schema.sql").write_text("-- tampered", encoding="utf-8")
@@ -1382,7 +1397,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             tmp_dir = Path(tmp)
             for m in discover_migrations(MIGRATIONS_DIR):
                 (tmp_dir / m.path.name).write_text(m.sql, encoding="utf-8")
-            (tmp_dir / "0004_broken.sql").write_text(
+            (tmp_dir / "0005_broken.sql").write_text(
                 "CREATE TABLE utda.should_not_exist (id INT); THIS IS INVALID SQL;",
                 encoding="utf-8",
             )
@@ -1453,7 +1468,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             migration_sslmode=cfg.migration_sslmode,
         )
         dry_plan = apply_migrations(dry_cfg, MIGRATIONS_DIR, dry_run=True)
-        self.assertEqual(len(dry_plan["pending"]), 3)
+        self.assertEqual(len(dry_plan["pending"]), 4)
         with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as chk:
             with chk.cursor() as cur:
                 cur.execute(
@@ -1616,13 +1631,17 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                         )
                     adm.commit()
 
-                # Add 0003 and verify upgrade + pre-existing row defaults + repeat-run idempotency
-                (udir / "0003_idempotency_fencing.sql").write_text(
-                    (MIGRATIONS_DIR / "0003_idempotency_fencing.sql").read_text(encoding="utf-8"),
-                    encoding="utf-8",
-                )
+                # Add 0003 and 0004 and verify upgrade + pre-existing row defaults + repeat-run idempotency
+                for fname in ("0003_idempotency_fencing.sql", "0004_idempotency_fence_version_hardening.sql"):
+                    (udir / fname).write_text(
+                        (MIGRATIONS_DIR / fname).read_text(encoding="utf-8"),
+                        encoding="utf-8",
+                    )
                 res_upg = apply_migrations(upg_cfg, udir, dry_run=False)
-                self.assertEqual(res_upg["applied"], ["0003_idempotency_fencing"])
+                self.assertEqual(
+                    res_upg["applied"],
+                    ["0003_idempotency_fencing", "0004_idempotency_fence_version_hardening"],
+                )
                 res_upg_again = apply_migrations(upg_cfg, udir, dry_run=False)
                 self.assertEqual(res_upg_again["applied"], [])
                 with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
@@ -1631,10 +1650,182 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                             "SELECT active_attempt_id, attempt_fence_version FROM utda_upgrade_0003_test.idempotency_keys WHERE idempotency_key = 'pre-key-1'"
                         )
                         self.assertEqual(cur.fetchone(), (None, 0))
+                        cur.execute(
+                            """
+                            SELECT data_type FROM information_schema.columns
+                            WHERE table_schema = 'utda_upgrade_0003_test'
+                              AND table_name = 'idempotency_keys'
+                              AND column_name = 'attempt_fence_version'
+                            """
+                        )
+                        self.assertEqual(cur.fetchone()[0], "bigint")
         finally:
             with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
                 with adm.cursor() as cur:
                     cur.execute("DROP SCHEMA IF EXISTS utda_upgrade_0003_test CASCADE")
+                adm.commit()
+
+        # Upgrade DB where original 0003 is ALREADY applied (with COMPLETED & active IN_PROGRESS rows),
+        # plus failed-0004 rollback and recovery -> validates items 3-10 of migration suite on PG16.
+        orig03_cfg = DatabaseConfig(
+            dsn=cfg.dsn,
+            migration_dsn=cfg.migration_dsn,
+            schema="utda_orig0003_upgrade_test",
+            pool_mode=cfg.pool_mode,
+            migration_pool_mode=cfg.migration_pool_mode,
+            sslmode=cfg.sslmode,
+            migration_sslmode=cfg.migration_sslmode,
+        )
+        with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+            with adm.cursor() as cur:
+                cur.execute("CREATE SCHEMA IF NOT EXISTS utda_orig0003_upgrade_test AUTHORIZATION utda_migrator")
+            adm.commit()
+        try:
+            with tempfile.TemporaryDirectory() as otmp:
+                odir = Path(otmp)
+                for fname in (
+                    "0001_initial_utda_schema.sql",
+                    "0002_roles_and_indexes.sql",
+                    "0003_idempotency_fencing.sql",
+                ):
+                    (odir / fname).write_text(
+                        (MIGRATIONS_DIR / fname).read_text(encoding="utf-8"),
+                        encoding="utf-8",
+                    )
+                pre03 = apply_migrations(orig03_cfg, odir, dry_run=False)
+                self.assertEqual(
+                    pre03["applied"],
+                    ["0001_initial_utda_schema", "0002_roles_and_indexes", "0003_idempotency_fencing"],
+                )
+
+                # Confirm pre-0004 attempt_fence_version is integer and seed active & completed rows
+                with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+                    with adm.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT data_type FROM information_schema.columns
+                            WHERE table_schema = 'utda_orig0003_upgrade_test'
+                              AND table_name = 'idempotency_keys'
+                              AND column_name = 'attempt_fence_version'
+                            """
+                        )
+                        self.assertEqual(cur.fetchone()[0], "integer")
+                        cur.execute(
+                            """
+                            INSERT INTO utda_orig0003_upgrade_test.projects (
+                                project_id, project_name, status, github_owner, github_repo, default_branch
+                            ) VALUES ('ORIG0003', 'Orig 0003', 'active', 'UNAI-TECH', 'orig3', 'main')
+                            """
+                        )
+                        cur.execute(
+                            """
+                            INSERT INTO utda_orig0003_upgrade_test.idempotency_keys (
+                                idempotency_key, scope, project_id, feature_id, report_blob_sha,
+                                target_document_id, status, active_attempt_id, attempt_fence_version
+                            ) VALUES
+                                ('orig03-done-key', 'phase1', 'ORIG0003', 'F1', 'b1', 'D06', 'COMPLETED', NULL, 1),
+                                ('orig03-active-key', 'phase1', 'ORIG0003', 'F2', 'b2', 'D06', 'IN_PROGRESS', 'orig-att-2', 2)
+                            """
+                        )
+                        cur.execute(
+                            """
+                            INSERT INTO utda_orig0003_upgrade_test.processing_attempts (
+                                attempt_id, idempotency_key, attempt_number, status
+                            ) VALUES
+                                ('orig-att-1', 'orig03-active-key', 1, 'FAILED'),
+                                ('orig-att-2', 'orig03-active-key', 2, 'IN_PROGRESS')
+                            """
+                        )
+                    adm.commit()
+
+                # Failed 0004 rolls back atomically leaving type integer and 0004 absent from schema_migrations
+                (odir / "0004_idempotency_fence_version_hardening.sql").write_text(
+                    "ALTER TABLE utda.idempotency_keys ALTER COLUMN attempt_fence_version TYPE BIGINT; BROKEN SQL;",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(MigrationError):
+                    apply_migrations(orig03_cfg, odir, dry_run=False)
+                with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+                    with adm.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT data_type FROM information_schema.columns
+                            WHERE table_schema = 'utda_orig0003_upgrade_test'
+                              AND table_name = 'idempotency_keys'
+                              AND column_name = 'attempt_fence_version'
+                            """
+                        )
+                        self.assertEqual(cur.fetchone()[0], "integer")
+                        cur.execute(
+                            "SELECT version FROM utda_orig0003_upgrade_test.schema_migrations WHERE version = '0004'"
+                        )
+                        self.assertIsNone(cur.fetchone())
+
+                # Replace with real 0004 and recover safely
+                (odir / "0004_idempotency_fence_version_hardening.sql").write_text(
+                    (MIGRATIONS_DIR / "0004_idempotency_fence_version_hardening.sql").read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                rec04 = apply_migrations(orig03_cfg, odir, dry_run=False)
+                self.assertEqual(rec04["applied"], ["0004_idempotency_fence_version_hardening"])
+                self.assertEqual(apply_migrations(orig03_cfg, odir, dry_run=True)["pending"], [])
+                self.assertEqual(apply_migrations(orig03_cfg, odir, dry_run=False)["applied"], [])
+
+                with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+                    with adm.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT idempotency_key, status, active_attempt_id, attempt_fence_version
+                            FROM utda_orig0003_upgrade_test.idempotency_keys
+                            ORDER BY idempotency_key
+                            """
+                        )
+                        self.assertEqual(
+                            cur.fetchall(),
+                            [
+                                ("orig03-active-key", "IN_PROGRESS", "orig-att-2", 2),
+                                ("orig03-done-key", "COMPLETED", None, 1),
+                            ],
+                        )
+                        cur.execute(
+                            """
+                            SELECT data_type FROM information_schema.columns
+                            WHERE table_schema = 'utda_orig0003_upgrade_test'
+                              AND table_name = 'idempotency_keys'
+                              AND column_name = 'attempt_fence_version'
+                            """
+                        )
+                        self.assertEqual(cur.fetchone()[0], "bigint")
+                        cur.execute(
+                            """
+                            SELECT version, checksum_sha256
+                            FROM utda_orig0003_upgrade_test.schema_migrations
+                            ORDER BY version
+                            """
+                        )
+                        mig_rows = {v: c for v, c in cur.fetchall()}
+                        self.assertEqual(
+                            mig_rows["0003"],
+                            "0161daaebb55dec4f6f1f600f5c76ca4dcd0e5e3abab2c392b5ab6f18c6d6d1b",
+                        )
+                        self.assertEqual(
+                            mig_rows["0004"],
+                            discover_migrations(MIGRATIONS_DIR)[3].checksum_sha256,
+                        )
+                    with self.assertRaises(psycopg.errors.CheckViolation):
+                        with adm.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE utda_orig0003_upgrade_test.idempotency_keys
+                                SET attempt_fence_version = -5
+                                WHERE idempotency_key = 'orig03-done-key'
+                                """
+                            )
+                    adm.rollback()
+        finally:
+            with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+                with adm.cursor() as cur:
+                    cur.execute("DROP SCHEMA IF EXISTS utda_orig0003_upgrade_test CASCADE")
                 adm.commit()
 
         with DatabaseManager(cfg) as db:
@@ -2026,7 +2217,12 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
         )
         self.assertEqual(
             res["applied"],
-            ["0001_initial_utda_schema", "0002_roles_and_indexes", "0003_idempotency_fencing"],
+            [
+                "0001_initial_utda_schema",
+                "0002_roles_and_indexes",
+                "0003_idempotency_fencing",
+                "0004_idempotency_fence_version_hardening",
+            ],
         )
         with psycopg.connect(boot_cfg.dsn, **boot_cfg.connect_kwargs()) as conn:
             with conn.cursor() as cur:
