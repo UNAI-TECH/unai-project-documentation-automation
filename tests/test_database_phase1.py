@@ -2477,6 +2477,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 )
             with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as chk:
                 with chk.cursor() as cur:
+                    cur.execute("SELECT set_config('utda.current_project_id', 'CI_CONC_TEST', true)")
                     cur.execute(
                         "SELECT status, active_attempt_id, attempt_fence_version, expires_at FROM utda.idempotency_keys WHERE idempotency_key = %s",
                         (idem,),
@@ -2522,6 +2523,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             self.assertEqual(ren_ok["fence_version"], 2)
             with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as chk:
                 with chk.cursor() as cur:
+                    cur.execute("SELECT set_config('utda.current_project_id', 'CI_CONC_TEST', true)")
                     cur.execute(
                         "SELECT expires_at, attempt_fence_version FROM utda.idempotency_keys WHERE idempotency_key = %s",
                         (idem,),
@@ -2540,7 +2542,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                         )
                     raise RuntimeError("Simulated mid-transaction abort")
 
-                db.run_in_transaction(_failing_tx)
+                db.run_in_project_transaction("CI_CONC_TEST", _failing_tx)
 
             # Real PG16 ambiguous commit test: drop connection right after server COMMIT
             # 1) DatabaseManager.run_in_transaction raises CommitOutcomeUnknownError (0 generic retries)
@@ -2697,6 +2699,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
 
         with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as rconn:
             with rconn.cursor() as cur:
+                cur.execute("SELECT set_config('utda.current_project_id', 'CI_CONC_TEST', true)")
                 cur.execute(
                     "SELECT attempt_number, status, retry_state, error_code FROM utda.processing_attempts WHERE idempotency_key = %s ORDER BY attempt_number",
                     (idem,),
