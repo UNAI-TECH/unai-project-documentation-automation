@@ -15,7 +15,8 @@ This directory maintains the mandatory Markdown verification reports for impleme
 
 | Date | Task | Commit SHA | Assessment | Report |
 | --- | --- | --- | --- | --- |
-| 2026-11-28 | Phase 1 — Final Verification, Fence-Version, Lease Renewal & CI Maintenance | `1576d19` | **PASS WITH LIMITATIONS** | [2026-11-28-phase1-verification-reconciliation-1576d19.md](2026-11-28-phase1-verification-reconciliation-1576d19.md) |
+| 2026-11-28 | Phase 1 — Migration History Preservation (`0003` Restored + `0004`) & Final Closure | `c0deb74` | **PASS WITH LIMITATIONS** | [2026-11-28-phase1-migration-history-closure-c0deb74.md](2026-11-28-phase1-migration-history-closure-c0deb74.md) |
+| 2026-11-28 | Phase 1 — Final Verification, Fence-Version, Lease Renewal & CI Maintenance | `1576d19` (`d8e67c3`) | **PASS WITH LIMITATIONS** | [2026-11-28-phase1-verification-reconciliation-1576d19.md](2026-11-28-phase1-verification-reconciliation-1576d19.md) |
 | 2026-11-27 | Phase 1 — Database Concurrency & Idempotency Hardening (`0003_idempotency_fencing`) | `0f1a82c` | **PASS WITH LIMITATIONS** | [2026-11-27-phase1-database-concurrency-idempotency-0f1a82c.md](2026-11-27-phase1-database-concurrency-idempotency-0f1a82c.md) |
 | 2026-11-27 | PostgreSQL 16 Security & Migration Verification Checklist | `f034f4e` (`7d5261c`) | **PASS WITH LIMITATIONS** | [POSTGRESQL_SECURITY_TEST_CHECKLIST.md](../../POSTGRESQL_SECURITY_TEST_CHECKLIST.md) |
 | 2026-11-27 | Phase 1 Test Report — Initial Testing Without Supabase | — | **PASS WITH LIMITATIONS** | [PHASE1_TEST_REPORT.md](../../PHASE1_TEST_REPORT.md) |
