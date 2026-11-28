@@ -15,7 +15,8 @@ This directory maintains the mandatory Markdown verification reports for impleme
 
 | Date | Task | Commit SHA | Assessment | Report |
 | --- | --- | --- | --- | --- |
-| 2026-11-28 | Phase 2B.1–2B.2 — Authoritative Project Identity & Transaction-Local DB Context | *(working tree)* | **PASS WITH LIMITATIONS** | [2026-11-28-phase2b-1-2-project-identity-db-context.md](2026-11-28-phase2b-1-2-project-identity-db-context.md) |
+| 2026-11-28 | Phase 2B.2 — PostgreSQL 16 Verification & Project-Scoping Closure | `7e1dc5c` | **VERIFIED** | [2026-11-28-phase2b-2-pg16-verification-closure-7e1dc5c.md](2026-11-28-phase2b-2-pg16-verification-closure-7e1dc5c.md) |
+| 2026-11-28 | Phase 2B.1–2B.2 — Authoritative Project Identity & Transaction-Local DB Context | `7e1dc5c` | **PASS WITH LIMITATIONS** | [2026-11-28-phase2b-1-2-project-identity-db-context.md](2026-11-28-phase2b-1-2-project-identity-db-context.md) |
 | 2026-11-28 | Phase 2A — Security, Project Isolation & Worker Execution Architecture Review | `b6bc9a3` *(baseline)* | **READY FOR REVIEW (`PASS WITH PREREQUISITES`)** | [2026-11-28-phase2a-architecture-review.md](2026-11-28-phase2a-architecture-review.md) |
 | 2026-11-28 | Phase 1 — Migration History Preservation (`0003` Restored + `0004`) & Final Closure | `c0deb74` | **PASS WITH LIMITATIONS** | [2026-11-28-phase1-migration-history-closure-c0deb74.md](2026-11-28-phase1-migration-history-closure-c0deb74.md) |
 | 2026-11-28 | Phase 1 — Final Verification, Fence-Version, Lease Renewal & CI Maintenance | `1576d19` (`d8e67c3`) | **PASS WITH LIMITATIONS** | [2026-11-28-phase1-verification-reconciliation-1576d19.md](2026-11-28-phase1-verification-reconciliation-1576d19.md) |
