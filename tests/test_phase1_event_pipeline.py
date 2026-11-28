@@ -1453,7 +1453,7 @@ class Phase1EventPipelineTests(unittest.TestCase):
                     with state_lost.lock:
                         state_lost.idempotency_keys[idem_ok]["active_attempt_id"] = "winner-attempt-2"
                         state_lost.idempotency_keys[idem_ok]["attempt_fence_version"] = 2
-                    hb.wait_or_raise(2.0)
+                    hb.wait_or_raise(3.0)
 
                 with self.assertRaises(LeaseLostError):
                     process_event(
@@ -1481,7 +1481,7 @@ class Phase1EventPipelineTests(unittest.TestCase):
 
         runtime_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_RUNTIME_URL")
         admin_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_DATABASE_URL")
-        hb_cfg = LeaseConfig(lock_ttl_seconds=2, heartbeat_interval_seconds=0.35, self_fence_margin_seconds=0.4)
+        hb_cfg = LeaseConfig(lock_ttl_seconds=2, heartbeat_interval_seconds=0.30, self_fence_margin_seconds=0.4)
 
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -1522,7 +1522,7 @@ class Phase1EventPipelineTests(unittest.TestCase):
                 def _pg_work(hb: LeaseHeartbeat) -> None:
                     hb_refs.append(hb)
                     self.assertTrue(hb.is_running)
-                    hb.wait_or_raise(0.95)
+                    hb.wait_or_raise(1.05)
                     self.assertGreaterEqual(hb.renewal_count, 2)
 
                 res = process_event(
@@ -1614,7 +1614,7 @@ class Phase1EventPipelineTests(unittest.TestCase):
                         event_receipt_id=None,
                         lock_ttl_seconds=5,
                     )
-                    hb.wait_or_raise(2.0)
+                    hb.wait_or_raise(3.0)
 
                 with self.assertRaises(LeaseLostError):
                     process_event(

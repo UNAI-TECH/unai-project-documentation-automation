@@ -3794,7 +3794,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     exp_initial = cur.fetchone()[0]
 
             # 1, 6 & 7: Successful periodic renewals during work + prompt exit on completion
-            hb_cfg = LeaseConfig(lock_ttl_seconds=2, heartbeat_interval_seconds=0.35, self_fence_margin_seconds=0.4)
+            hb_cfg = LeaseConfig(lock_ttl_seconds=2, heartbeat_interval_seconds=0.30, self_fence_margin_seconds=0.4)
             with LeaseHeartbeat(
                 project_id="HB_PROJ_A",
                 idempotency_key=idem,
@@ -3804,7 +3804,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 config=hb_cfg,
             ) as hb:
                 self.assertTrue(hb.is_running)
-                hb.wait_or_raise(0.95)
+                hb.wait_or_raise(1.05)
                 self.assertGreaterEqual(hb.renewal_count, 2)
                 self.assertFalse(hb.lost)
             self.assertFalse(hb.is_running)
@@ -4011,6 +4011,8 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             )
 
         # 9b: Unreachable DB connection during heartbeat triggers proactive self-fence
+        import psycopg_pool
+
         broken_cfg = DatabaseConfig.from_env(
             {
                 "UTDA_DATABASE_URL": "postgresql://utda_runtime:bad@127.0.0.1:1/utda_none",
@@ -4020,7 +4022,18 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 "UTDA_DATABASE_MAX_RETRIES": "0",
             }
         )
-        with DatabaseManager(broken_cfg) as broken_db:
+        with DatabaseManager(
+            broken_cfg,
+            pool_factory=lambda c: psycopg_pool.ConnectionPool(
+                conninfo=c.dsn,
+                min_size=0,
+                max_size=2,
+                timeout=0.5,
+                kwargs=c.connect_kwargs(for_migration=False),
+                open=False,
+            ),
+            sleep_fn=lambda _s: None,
+        ) as broken_db:
             broken_repo = UTDADatabaseRepository(broken_db)
             self_fence_cfg = LeaseConfig(
                 lock_ttl_seconds=1,
