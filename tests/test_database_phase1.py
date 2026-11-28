@@ -2300,6 +2300,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 "0002_roles_and_indexes",
                 "0003_idempotency_fencing",
                 "0004_idempotency_fence_version_hardening",
+                "0005_project_row_level_security",
             ],
         )
         with psycopg.connect(boot_cfg.dsn, **boot_cfg.connect_kwargs()) as conn:
