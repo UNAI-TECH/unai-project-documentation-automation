@@ -1,9 +1,17 @@
-"""PostgreSQL / Supabase database connection manager and Phase 1 persistence store.
+"""PostgreSQL / Supabase database connection manager and persistence store.
 
 Provides pooled connections, pre-commit retry handling for transient failures,
 fail-closed CommitOutcomeUnknownError on ambiguous commits with safe stable-ID
-reconciliation, atomic fenced idempotency claims/finalization, and immutable
-request-identity verification.
+reconciliation, atomic fenced idempotency claims/finalization, immutable
+request-identity verification, and transaction-local project context scoping.
+
+Security boundary note:
+    The transaction-local GUC `utda.current_project_id` set via
+    `SELECT set_config('utda.current_project_id', %s, true)` is a
+    project-scoping context, NOT an authenticated tenant identity. It protects
+    against accidental unscoped queries when combined with application validation
+    (and future database RLS policies), but it does not independently defend
+    against arbitrary SQL executed under a shared runtime credential.
 """
 from __future__ import annotations
 
@@ -21,6 +29,7 @@ from engine.db_config import (
     DatabaseConfig,
     quote_ident,
     validate_identifier,
+    validate_project_id,
 )
 from engine.sanitization import (
     configure_sanitized_logger,
@@ -73,6 +82,22 @@ def _require_driver() -> None:
         raise RuntimeError(
             "psycopg and psycopg_pool are required. Install with: pip install -r requirements.txt"
         )
+
+
+def set_transaction_project_context(cur: Any, project_id: str) -> str:
+    """Validate and set transaction-local `utda.current_project_id` via set_config.
+
+    Security boundary note: `utda.current_project_id` is a transaction-scoped
+    project context (reset automatically on COMMIT or ROLLBACK), not an
+    authenticated tenant identity. It guards against accidental unscoped
+    queries but cannot alone block arbitrary SQL run by the shared runtime role.
+    """
+    validated = validate_project_id(project_id)
+    cur.execute(
+        "SELECT set_config('utda.current_project_id', %s, true)",
+        (validated,),
+    )
+    return validated
 
 
 def _default_pool_factory(config: DatabaseConfig) -> Any:
@@ -169,12 +194,16 @@ class DatabaseManager:
             yield conn
 
     @contextmanager
-    def transaction(self) -> Iterator[Any]:
-        """Acquire a connection, apply statement timeout, commit or roll back atomically.
+    def transaction(self, *, project_id: str | None = None) -> Iterator[Any]:
+        """Acquire a connection, apply statement timeout & optional project GUC, commit/rollback.
 
+        When `project_id` is supplied, validates it before acquiring a connection and sets
+        transaction-local `utda.current_project_id` (`is_local=true`) inside the transaction
+        before yielding to callers. Explicitly global probes leave `project_id=None`.
         Never retries generically after an ambiguous commit failure; raises
         CommitOutcomeUnknownError instead so callers can reconcile via stable IDs.
         """
+        validated_pid = validate_project_id(project_id) if project_id is not None else None
         with self.connection() as conn:
             committed = False
             in_commit = False
@@ -183,6 +212,8 @@ class DatabaseManager:
                     cur.execute(
                         f"SET LOCAL statement_timeout = {int(self.config.statement_timeout_ms)}"
                     )
+                    if validated_pid is not None:
+                        set_transaction_project_context(cur, validated_pid)
                 yield conn
                 in_commit = True
                 conn.commit()
@@ -207,16 +238,30 @@ class DatabaseManager:
                             sanitize_log_text(str(rb_err)),
                         )
 
-    def run_in_transaction(self, fn: Callable[[Any], T]) -> T:
+    def run_in_transaction(
+        self,
+        fn: Callable[[Any], T],
+        *,
+        project_id: str | None = None,
+    ) -> T:
         """Run a transactional callback with pre-commit transient retry safety."""
+        validated_pid = validate_project_id(project_id) if project_id is not None else None
+
         def _attempt() -> T:
-            with self.transaction() as conn:
+            with self.transaction(project_id=validated_pid) as conn:
                 return fn(conn)
 
         return self.execute_with_retry(_attempt)
 
-    def run_readonly(self, fn: Callable[[Any], T]) -> T:
+    def run_readonly(
+        self,
+        fn: Callable[[Any], T],
+        *,
+        project_id: str | None = None,
+    ) -> T:
         """Execute a read-only reconciliation/lookup query with clean rollback."""
+        validated_pid = validate_project_id(project_id) if project_id is not None else None
+
         def _attempt() -> T:
             with self.connection() as conn:
                 try:
@@ -224,6 +269,8 @@ class DatabaseManager:
                         cur.execute(
                             f"SET LOCAL statement_timeout = {int(self.config.statement_timeout_ms)}"
                         )
+                        if validated_pid is not None:
+                            set_transaction_project_context(cur, validated_pid)
                     return fn(conn)
                 finally:
                     try:
@@ -232,6 +279,27 @@ class DatabaseManager:
                         pass
 
         return self.execute_with_retry(_attempt)
+
+    @contextmanager
+    def project_transaction(self, project_id: str) -> Iterator[Any]:
+        """Require a validated canonical project_id and open a project-scoped transaction."""
+        validated_pid = validate_project_id(project_id)
+        with self.transaction(project_id=validated_pid) as conn:
+            yield conn
+
+    def run_in_project_transaction(
+        self, project_id: str, fn: Callable[[Any], T]
+    ) -> T:
+        """Require a validated canonical project_id and execute inside a project-scoped tx."""
+        validated_pid = validate_project_id(project_id)
+        return self.run_in_transaction(fn, project_id=validated_pid)
+
+    def run_project_readonly(
+        self, project_id: str, fn: Callable[[Any], T]
+    ) -> T:
+        """Require a validated canonical project_id and execute a project-scoped read-only lookup."""
+        validated_pid = validate_project_id(project_id)
+        return self.run_readonly(fn, project_id=validated_pid)
 
 
 class UTDADatabaseRepository:
@@ -257,6 +325,7 @@ class UTDADatabaseRepository:
         template_version: str = "",
         registry_metadata: dict[str, Any] | None = None,
     ) -> None:
+        pid = validate_project_id(project_id)
         sql = f"""
             INSERT INTO {self._tbl('projects')} (
                 project_id, project_name, status, github_owner, github_repo,
@@ -282,7 +351,7 @@ class UTDADatabaseRepository:
                 cur.execute(
                     sql,
                     (
-                        project_id,
+                        pid,
                         project_name,
                         status,
                         github_owner,
@@ -295,7 +364,7 @@ class UTDADatabaseRepository:
                 )
 
         try:
-            self.db.run_in_transaction(_op)
+            self.db.run_in_project_transaction(pid, _op)
         except CommitOutcomeUnknownError:
             # Reconcile against persisted project row by stable primary key project_id.
             def _check(conn: Any) -> tuple[Any, ...] | None:
@@ -307,11 +376,11 @@ class UTDADatabaseRepository:
                         FROM {self._tbl('projects')}
                         WHERE project_id = %s
                         """,
-                        (project_id,),
+                        (pid,),
                     )
                     return cur.fetchone()
 
-            existing = self.db.run_readonly(_check)
+            existing = self.db.run_project_readonly(pid, _check)
             target = (
                 project_name,
                 status,
@@ -323,7 +392,7 @@ class UTDADatabaseRepository:
             )
             if existing == target:
                 return
-            self.db.run_in_transaction(_op)
+            self.db.run_in_project_transaction(pid, _op)
 
     def record_event_receipt(
         self,
@@ -331,7 +400,7 @@ class UTDADatabaseRepository:
         delivery_id: str,
         event_name: str,
         repository: str,
-        project_id: str | None,
+        project_id: str,
         feature_id: str | None,
         git_sha: str,
         pr_number: int | None = None,
@@ -339,6 +408,7 @@ class UTDADatabaseRepository:
         payload_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Persist a GitHub event receipt idempotently and return its canonical receipt_id."""
+        pid = validate_project_id(project_id)
         receipt_id = str(uuid.uuid4())
         tbl = self._tbl("github_event_receipts")
         insert_sql = f"""
@@ -362,7 +432,7 @@ class UTDADatabaseRepository:
                         delivery_id,
                         event_name,
                         repository,
-                        project_id,
+                        pid,
                         feature_id,
                         git_sha,
                         pr_number,
@@ -386,7 +456,7 @@ class UTDADatabaseRepository:
                 }
 
         try:
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
         except CommitOutcomeUnknownError:
             def _reconcile(conn: Any) -> str | None:
                 with conn.cursor() as cur:
@@ -394,7 +464,7 @@ class UTDADatabaseRepository:
                     row = cur.fetchone()
                     return row[0] if row else None
 
-            existing_id = self.db.run_readonly(_reconcile)
+            existing_id = self.db.run_project_readonly(pid, _reconcile)
             if existing_id is not None:
                 return {
                     "inserted": existing_id == receipt_id,
@@ -402,7 +472,7 @@ class UTDADatabaseRepository:
                     "delivery_id": delivery_id,
                     "reconciled": True,
                 }
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
 
     def correlate_feature_state(
         self,
@@ -415,6 +485,7 @@ class UTDADatabaseRepository:
         force_status: str | None = None,
     ) -> dict[str, Any]:
         """Correlate PR merge and canonical JSON report in either arrival order."""
+        pid = validate_project_id(project_id)
         state_id = str(uuid.uuid4())
         tbl = self._tbl("feature_processing_states")
         sql = f"""
@@ -461,7 +532,7 @@ class UTDADatabaseRepository:
                     sql,
                     (
                         state_id,
-                        project_id,
+                        pid,
                         feature_id,
                         initial_status,
                         pr_number,
@@ -482,9 +553,9 @@ class UTDADatabaseRepository:
                 }
 
         try:
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
         except CommitOutcomeUnknownError:
-            current = self.get_feature_state(project_id=project_id, feature_id=feature_id)
+            current = self.get_feature_state(project_id=pid, feature_id=feature_id)
             if current is not None:
                 pr_ok = (pr_merged_sha is None) or (current["pr_merged_sha"] == pr_merged_sha)
                 rep_ok = (report_blob_sha is None) or (current["report_blob_sha"] == report_blob_sha)
@@ -497,12 +568,13 @@ class UTDADatabaseRepository:
                         "report_blob_sha": current["report_blob_sha"],
                         "reconciled": True,
                     }
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
 
     def get_feature_state(
         self, *, project_id: str, feature_id: str
     ) -> dict[str, Any] | None:
         """Return current correlation state for (project_id, feature_id)."""
+        pid = validate_project_id(project_id)
         sql = f"""
             SELECT state_id, status, pr_number, pr_merged_sha, report_blob_sha
             FROM {self._tbl('feature_processing_states')}
@@ -511,7 +583,7 @@ class UTDADatabaseRepository:
 
         def _op(conn: Any) -> dict[str, Any] | None:
             with conn.cursor() as cur:
-                cur.execute(sql, (project_id, feature_id))
+                cur.execute(sql, (pid, feature_id))
                 row = cur.fetchone()
                 if not row:
                     return None
@@ -523,7 +595,7 @@ class UTDADatabaseRepository:
                     "report_blob_sha": row[4],
                 }
 
-        return self.db.run_in_transaction(_op)
+        return self.db.run_in_project_transaction(pid, _op)
 
     def claim_idempotency_and_attempt(
         self,
@@ -538,6 +610,7 @@ class UTDADatabaseRepository:
         lock_ttl_seconds: int = 900,
     ) -> dict[str, Any]:
         """Atomically claim fenced idempotency lock, verify immutable identity, and return attempt_id."""
+        pid = validate_project_id(project_id)
         if lock_ttl_seconds <= 0:
             raise ValueError("lock_ttl_seconds must be positive.")
 
@@ -546,7 +619,7 @@ class UTDADatabaseRepository:
         attempt_id = str(uuid.uuid4())
         requested_identity = (
             scope,
-            project_id,
+            pid,
             feature_id,
             report_blob_sha,
             target_document_id,
@@ -614,7 +687,7 @@ class UTDADatabaseRepository:
                     (
                         idempotency_key,
                         scope,
-                        project_id,
+                        pid,
                         feature_id,
                         report_blob_sha,
                         target_document_id,
@@ -691,7 +764,7 @@ class UTDADatabaseRepository:
                 }
 
         try:
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
         except CommitOutcomeUnknownError:
             # Reconcile by stable attempt_id generated for this specific claim invocation.
             def _reconcile(conn: Any) -> dict[str, Any] | None:
@@ -717,7 +790,7 @@ class UTDADatabaseRepository:
                         "fence_version": int(row[4] or 0),
                     }
 
-            reconciled = self.db.run_readonly(_reconcile)
+            reconciled = self.db.run_project_readonly(pid, _reconcile)
             if reconciled is not None:
                 if reconciled["active_attempt_id"] == attempt_id and reconciled["key_status"] == "IN_PROGRESS":
                     return {
@@ -731,11 +804,12 @@ class UTDADatabaseRepository:
                 raise StaleAttemptError(
                     f"Claim attempt '{attempt_id}' committed prior to connection drop but was already superseded."
                 )
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
 
     def finalize_processing_attempt(
         self,
         *,
+        project_id: str,
         event_receipt_id: str | None,
         idempotency_key: str,
         attempt_id: str,
@@ -748,7 +822,8 @@ class UTDADatabaseRepository:
         error_summary: str | None = None,
         result_summary: dict[str, Any] | None = None,
     ) -> str:
-        """Lock, verify active_attempt_id fencing token, and atomically finalize attempt + key."""
+        """Lock, verify project_id + active_attempt_id fencing token, and atomically finalize."""
+        pid = validate_project_id(project_id)
         if not attempt_id or not str(attempt_id).strip():
             raise StaleAttemptError(
                 "attempt_id is mandatory to finalize an idempotency processing attempt."
@@ -757,7 +832,7 @@ class UTDADatabaseRepository:
         attempts_tbl = self._tbl("processing_attempts")
         keys_tbl = self._tbl("idempotency_keys")
         lock_key_sql = f"""
-            SELECT status, active_attempt_id, attempt_fence_version,
+            SELECT project_id, status, active_attempt_id, attempt_fence_version,
                    (expires_at IS NOT NULL AND expires_at < NOW()) AS is_expired
             FROM {keys_tbl}
             WHERE idempotency_key = %s
@@ -782,6 +857,7 @@ class UTDADatabaseRepository:
                 completed_at = NOW(),
                 result_summary = %s::jsonb
             WHERE idempotency_key = %s
+              AND project_id = %s
               AND status = 'IN_PROGRESS'
               AND active_attempt_id = %s
             RETURNING idempotency_key
@@ -798,7 +874,11 @@ class UTDADatabaseRepository:
                         f"Idempotency key '{sanitize_log_text(idempotency_key)}' was not found."
                     )
 
-                key_status, active_attempt_id, row_fence_ver, is_expired = key_row
+                row_project_id, key_status, active_attempt_id, row_fence_ver, is_expired = key_row
+                if row_project_id != pid:
+                    raise IdempotencyIdentityMismatchError(
+                        f"Idempotency key '{sanitize_log_text(idempotency_key)}' belongs to another project."
+                    )
                 if key_status != "IN_PROGRESS":
                     raise StaleAttemptError(
                         f"Cannot finalize attempt '{attempt_id}': key status is '{key_status}', expected 'IN_PROGRESS'."
@@ -839,7 +919,7 @@ class UTDADatabaseRepository:
 
                 cur.execute(
                     complete_key_sql,
-                    (final_key_status, summary_json, idempotency_key, attempt_id),
+                    (final_key_status, summary_json, idempotency_key, pid, attempt_id),
                 )
                 if cur.fetchone() is None:
                     raise StaleAttemptError(
@@ -848,7 +928,7 @@ class UTDADatabaseRepository:
                 return att_row[0]
 
         try:
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
         except CommitOutcomeUnknownError:
             def _reconcile(conn: Any) -> dict[str, Any] | None:
                 with conn.cursor() as cur:
@@ -859,9 +939,9 @@ class UTDADatabaseRepository:
                         FROM {keys_tbl} ik
                         LEFT JOIN {attempts_tbl} pa
                           ON pa.idempotency_key = ik.idempotency_key AND pa.attempt_id = %s
-                        WHERE ik.idempotency_key = %s
+                        WHERE ik.idempotency_key = %s AND ik.project_id = %s
                         """,
-                        (attempt_id, idempotency_key),
+                        (attempt_id, idempotency_key, pid),
                     )
                     row = cur.fetchone()
                     if row is None:
@@ -873,7 +953,7 @@ class UTDADatabaseRepository:
                         "is_expired": bool(row[3]),
                     }
 
-            state = self.db.run_readonly(_reconcile)
+            state = self.db.run_project_readonly(pid, _reconcile)
             if state is None:
                 raise StaleAttemptError(f"Idempotency key '{idempotency_key}' missing during reconciliation.")
             if (
@@ -888,7 +968,7 @@ class UTDADatabaseRepository:
                 and state["active_attempt_id"] == attempt_id
                 and not state["is_expired"]
             ):
-                return self.db.run_in_transaction(_op)
+                return self.db.run_in_project_transaction(pid, _op)
             raise StaleAttemptError(
                 f"Stale attempt '{attempt_id}' rejected after ambiguous commit reconciliation."
             )
@@ -896,12 +976,14 @@ class UTDADatabaseRepository:
     def renew_attempt_lease(
         self,
         *,
+        project_id: str,
         idempotency_key: str,
         attempt_id: str,
         expected_fence_version: int,
         extend_ttl_seconds: int = 900,
     ) -> dict[str, Any]:
-        """Atomically extend lease expiry when active_attempt_id and attempt_fence_version match."""
+        """Atomically extend lease expiry when project_id, active_attempt_id, and fence match."""
+        pid = validate_project_id(project_id)
         if not attempt_id or not str(attempt_id).strip():
             raise StaleAttemptError("attempt_id is required to renew a processing lease.")
         if extend_ttl_seconds <= 0:
@@ -910,7 +992,7 @@ class UTDADatabaseRepository:
         keys_tbl = self._tbl("idempotency_keys")
         attempts_tbl = self._tbl("processing_attempts")
         lock_key_sql = f"""
-            SELECT status, active_attempt_id, attempt_fence_version,
+            SELECT project_id, status, active_attempt_id, attempt_fence_version,
                    (expires_at IS NOT NULL AND expires_at < NOW()) AS is_expired
             FROM {keys_tbl}
             WHERE idempotency_key = %s
@@ -920,6 +1002,7 @@ class UTDADatabaseRepository:
             UPDATE {keys_tbl}
             SET expires_at = NOW() + (%s::integer * INTERVAL '1 second')
             WHERE idempotency_key = %s
+              AND project_id = %s
               AND status = 'IN_PROGRESS'
               AND active_attempt_id = %s
               AND attempt_fence_version = %s
@@ -934,7 +1017,11 @@ class UTDADatabaseRepository:
                     raise StaleAttemptError(
                         f"Idempotency key '{sanitize_log_text(idempotency_key)}' was not found."
                     )
-                key_status, active_attempt_id, row_fence_ver, is_expired = key_row
+                row_project_id, key_status, active_attempt_id, row_fence_ver, is_expired = key_row
+                if row_project_id != pid:
+                    raise IdempotencyIdentityMismatchError(
+                        f"Idempotency key '{sanitize_log_text(idempotency_key)}' belongs to another project."
+                    )
                 if key_status != "IN_PROGRESS":
                     raise StaleAttemptError(
                         f"Cannot renew lease for '{attempt_id}': key status is '{key_status}'."
@@ -964,7 +1051,7 @@ class UTDADatabaseRepository:
 
                 cur.execute(
                     renew_sql,
-                    (extend_ttl_seconds, idempotency_key, attempt_id, expected_fence_version),
+                    (extend_ttl_seconds, idempotency_key, pid, attempt_id, expected_fence_version),
                 )
                 upd = cur.fetchone()
                 if upd is None:
@@ -979,7 +1066,7 @@ class UTDADatabaseRepository:
                     "expires_at": upd[0].isoformat() if hasattr(upd[0], "isoformat") else str(upd[0]),
                 }
 
-        return self.db.run_in_transaction(_op)
+        return self.db.run_in_project_transaction(pid, _op)
 
     def acquire_idempotency_key(
         self,
@@ -1011,8 +1098,9 @@ class UTDADatabaseRepository:
         )
         return bool(res["claimed"])
 
-    def next_attempt_number(self, *, idempotency_key: str) -> int:
+    def next_attempt_number(self, *, project_id: str, idempotency_key: str) -> int:
         """Deprecated: use claim_idempotency_and_attempt() for lock-serialized allocation."""
+        pid = validate_project_id(project_id)
         warnings.warn(
             "next_attempt_number() is deprecated; use claim_idempotency_and_attempt().",
             DeprecationWarning,
@@ -1030,17 +1118,19 @@ class UTDADatabaseRepository:
                 row = cur.fetchone()
                 return int(row[0]) if row else 1
 
-        return self.db.run_in_transaction(_op)
+        return self.db.run_in_project_transaction(pid, _op)
 
     def complete_idempotency_key(
         self,
         *,
+        project_id: str,
         idempotency_key: str,
         status: str,
         result_summary: dict[str, Any] | None = None,
         attempt_id: str | None = None,
     ) -> None:
         """Deprecated: use finalize_processing_attempt(..., attempt_id=...) instead."""
+        pid = validate_project_id(project_id)
         warnings.warn(
             "complete_idempotency_key() is deprecated; use finalize_processing_attempt(..., attempt_id=...).",
             DeprecationWarning,
@@ -1051,6 +1141,7 @@ class UTDADatabaseRepository:
                 "complete_idempotency_key requires attempt_id to prevent bypassing active-attempt fencing."
             )
         self.finalize_processing_attempt(
+            project_id=pid,
             event_receipt_id=None,
             idempotency_key=idempotency_key,
             attempt_id=attempt_id,
@@ -1062,6 +1153,7 @@ class UTDADatabaseRepository:
     def record_processing_attempt(
         self,
         *,
+        project_id: str,
         event_receipt_id: str | None,
         idempotency_key: str,
         attempt_number: int,
@@ -1072,6 +1164,7 @@ class UTDADatabaseRepository:
         attempt_id: str | None = None,
     ) -> str:
         """Deprecated: use claim_idempotency_and_attempt() and finalize_processing_attempt()."""
+        pid = validate_project_id(project_id)
         warnings.warn(
             "record_processing_attempt() is deprecated; use claim_idempotency_and_attempt() "
             "and finalize_processing_attempt().",
@@ -1086,13 +1179,17 @@ class UTDADatabaseRepository:
         def _op(conn: Any) -> str:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT status, active_attempt_id FROM {keys_tbl} WHERE idempotency_key = %s FOR UPDATE",
+                    f"SELECT project_id, status, active_attempt_id FROM {keys_tbl} WHERE idempotency_key = %s FOR UPDATE",
                     (idempotency_key,),
                 )
                 krow = cur.fetchone()
                 if krow is None:
                     raise StaleAttemptError(f"Idempotency key '{idempotency_key}' does not exist.")
-                kstatus, active_id = krow
+                kproject_id, kstatus, active_id = krow
+                if kproject_id != pid:
+                    raise IdempotencyIdentityMismatchError(
+                        f"Idempotency key '{sanitize_log_text(idempotency_key)}' belongs to another project."
+                    )
                 if kstatus == "IN_PROGRESS" and active_id is not None and attempt_id != active_id:
                     raise StaleAttemptError(
                         f"Cannot record attempt without matching active attempt_id '{active_id}'."
@@ -1118,7 +1215,7 @@ class UTDADatabaseRepository:
                 )
                 return resolved_attempt_id
 
-        return self.db.run_in_transaction(_op)
+        return self.db.run_in_project_transaction(pid, _op)
 
     def record_final_report(
         self,
@@ -1135,6 +1232,7 @@ class UTDADatabaseRepository:
         evidence_refs: list[Any],
     ) -> dict[str, Any]:
         """Persist validated canonical JSON report idempotently and return existing report_id."""
+        pid = validate_project_id(project_id)
         report_id = str(uuid.uuid4())
         tbl = self._tbl("final_reports")
         insert_sql = f"""
@@ -1162,7 +1260,7 @@ class UTDADatabaseRepository:
                     insert_sql,
                     (
                         report_id,
-                        project_id,
+                        pid,
                         feature_id,
                         safe_feature_name,
                         change_type,
@@ -1180,7 +1278,7 @@ class UTDADatabaseRepository:
                         "inserted": True,
                         "report_id": row[0],
                     }
-                cur.execute(select_sql, (project_id, feature_id, report_blob_sha))
+                cur.execute(select_sql, (pid, feature_id, report_blob_sha))
                 existing = cur.fetchone()
                 return {
                     "inserted": False,
@@ -1188,34 +1286,35 @@ class UTDADatabaseRepository:
                 }
 
         try:
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
         except CommitOutcomeUnknownError:
             def _reconcile(conn: Any) -> str | None:
                 with conn.cursor() as cur:
-                    cur.execute(select_sql, (project_id, feature_id, report_blob_sha))
+                    cur.execute(select_sql, (pid, feature_id, report_blob_sha))
                     row = cur.fetchone()
                     return row[0] if row else None
 
-            existing_id = self.db.run_readonly(_reconcile)
+            existing_id = self.db.run_project_readonly(pid, _reconcile)
             if existing_id is not None:
                 return {
                     "inserted": existing_id == report_id,
                     "report_id": existing_id,
                     "reconciled": True,
                 }
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
 
     def append_audit_event(
         self,
         *,
         actor: str,
         event_type: str,
-        project_id: str | None = None,
+        project_id: str,
         feature_id: str | None = None,
         document_id: str | None = None,
         idempotency_key: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> str:
+        pid = validate_project_id(project_id)
         event_id = str(uuid.uuid4())
         tbl = self._tbl("audit_events")
         sql = f"""
@@ -1235,7 +1334,7 @@ class UTDADatabaseRepository:
                         event_id,
                         actor,
                         event_type,
-                        project_id,
+                        pid,
                         feature_id,
                         document_id,
                         idempotency_key,
@@ -1245,7 +1344,7 @@ class UTDADatabaseRepository:
                 return event_id
 
         try:
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)
         except CommitOutcomeUnknownError:
             def _check(conn: Any) -> str | None:
                 with conn.cursor() as cur:
@@ -1253,7 +1352,7 @@ class UTDADatabaseRepository:
                     row = cur.fetchone()
                     return row[0] if row else None
 
-            existing_id = self.db.run_readonly(_check)
+            existing_id = self.db.run_project_readonly(pid, _check)
             if existing_id is not None:
                 return existing_id
-            return self.db.run_in_transaction(_op)
+            return self.db.run_in_project_transaction(pid, _op)

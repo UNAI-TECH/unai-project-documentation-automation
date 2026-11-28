@@ -27,6 +27,7 @@ from engine.db_config import (
     quote_ident,
     redact_dsn,
     validate_identifier,
+    validate_project_id,
 )
 from engine.sanitization import sanitize_log_text, sanitize_value
 from engine.db_health import check_database_health
@@ -89,6 +90,14 @@ class _FakeCursor:
         self._idx = 0
 
         if norm.startswith("SET LOCAL statement_timeout"):
+            return
+        if norm.startswith("SELECT set_config('utda.current_project_id'"):
+            self.conn.current_project_id = params[0]
+            self.conn.executed_params.append((sql.strip(), params))
+            self._rows = [(params[0],)]
+            return
+        if "SELECT current_setting('utda.current_project_id', true)" in norm:
+            self._rows = [(self.conn.current_project_id,)]
             return
         if norm == "SELECT CURRENT_USER":
             self._rows = [(state.current_user,)]
@@ -236,26 +245,40 @@ class _FakeCursor:
                         )
                     ]
             return
-        if "SELECT status, active_attempt_id, attempt_fence_version" in norm and ".idempotency_keys" in norm:
+        if ("SELECT project_id, status, active_attempt_id, attempt_fence_version" in norm or "SELECT status, active_attempt_id, attempt_fence_version" in norm) and ".idempotency_keys" in norm:
             idem_key = params[0]
             with state.lock:
                 rec = state.idempotency_keys.get(idem_key)
                 if rec:
-                    self._rows = [
-                        (
-                            rec["status"],
-                            rec.get("active_attempt_id"),
-                            rec.get("attempt_fence_version", 0),
-                            bool(rec.get("expired", False)),
-                        )
-                    ]
+                    if norm.startswith("SELECT project_id,"):
+                        self._rows = [
+                            (
+                                rec["project_id"],
+                                rec["status"],
+                                rec.get("active_attempt_id"),
+                                rec.get("attempt_fence_version", 0),
+                                bool(rec.get("expired", False)),
+                            )
+                        ]
+                    else:
+                        self._rows = [
+                            (
+                                rec["status"],
+                                rec.get("active_attempt_id"),
+                                rec.get("attempt_fence_version", 0),
+                                bool(rec.get("expired", False)),
+                            )
+                        ]
             return
-        if "SELECT status, active_attempt_id FROM" in norm and ".idempotency_keys" in norm:
+        if ("SELECT project_id, status, active_attempt_id FROM" in norm or "SELECT status, active_attempt_id FROM" in norm) and ".idempotency_keys" in norm:
             idem_key = params[0]
             with state.lock:
                 rec = state.idempotency_keys.get(idem_key)
                 if rec:
-                    self._rows = [(rec["status"], rec.get("active_attempt_id"))]
+                    if norm.startswith("SELECT project_id,"):
+                        self._rows = [(rec["project_id"], rec["status"], rec.get("active_attempt_id"))]
+                    else:
+                        self._rows = [(rec["status"], rec.get("active_attempt_id"))]
             return
         if "SELECT pa.attempt_number, pa.status, ik.status, ik.active_attempt_id, ik.attempt_fence_version" in norm:
             attempt_id, idem_key = params
@@ -277,10 +300,12 @@ class _FakeCursor:
                     ]
             return
         if "SELECT pa.status, ik.status, ik.active_attempt_id" in norm:
-            attempt_id, idem_key = params
+            attempt_id = params[0]
+            idem_key = params[1]
+            proj_filter = params[2] if len(params) > 2 else None
             with state.lock:
                 ik = state.idempotency_keys.get(idem_key)
-                if ik:
+                if ik and (proj_filter is None or ik.get("project_id") == proj_filter):
                     att = next(
                         (a for a in state.attempts if a["attempt_id"] == attempt_id and a["idempotency_key"] == idem_key),
                         None,
@@ -386,11 +411,12 @@ class _FakeCursor:
         if "SET expires_at = NOW()" in norm and ".idempotency_keys" in norm and "attempt_fence_version = %s" in norm:
             from datetime import datetime, timedelta, timezone
 
-            ttl, idem_key, active_attempt_id, expected_ver = params
+            ttl, idem_key, proj_id, active_attempt_id, expected_ver = params
             with state.lock:
                 rec = state.idempotency_keys.get(idem_key)
                 if (
                     rec
+                    and rec.get("project_id") == proj_id
                     and rec.get("status") == "IN_PROGRESS"
                     and rec.get("active_attempt_id") == active_attempt_id
                     and int(rec.get("attempt_fence_version", 0)) == int(expected_ver)
@@ -407,10 +433,15 @@ class _FakeCursor:
         if "UPDATE" in norm and ".idempotency_keys" in norm and "active_attempt_id = NULL" in norm:
             import json as _json
 
-            status, summary_json, idem_key, active_attempt_id = params
+            status, summary_json, idem_key, proj_id, active_attempt_id = params
             with state.lock:
                 rec = state.idempotency_keys.get(idem_key)
-                if rec and rec.get("status") == "IN_PROGRESS" and rec.get("active_attempt_id") == active_attempt_id:
+                if (
+                    rec
+                    and rec.get("project_id") == proj_id
+                    and rec.get("status") == "IN_PROGRESS"
+                    and rec.get("active_attempt_id") == active_attempt_id
+                ):
                     self.conn.undo_ops.append(("idem_key", idem_key, copy.deepcopy(rec)))
                     rec["status"] = status
                     rec["active_attempt_id"] = None
@@ -487,6 +518,8 @@ class _FakeConnection:
         self.pending_ops: list[tuple[str, object]] = []
         self.undo_ops: list[tuple] = []
         self.executed_sql: list[str] = []
+        self.executed_params: list[tuple[str, tuple]] = []
+        self.current_project_id: str | None = None
 
     def __enter__(self) -> "_FakeConnection":
         return self
@@ -508,6 +541,7 @@ class _FakeConnection:
                 raise err_cls("Simulated transient drop during COMMIT")
         self.committed += 1
         self._apply_pending()
+        self.current_project_id = None
 
     def _apply_pending(self) -> None:
         with self.state.lock:
@@ -551,6 +585,7 @@ class _FakeConnection:
                     self.state.attempts = undo[1]
             self.undo_ops.clear()
             self.pending_ops.clear()
+            self.current_project_id = None
 
 
 class _FakePool:
@@ -560,11 +595,14 @@ class _FakePool:
         fail_connect_times: int = 0,
         fail_commit_times: int = 0,
         commit_drops_after_apply: bool = False,
+        reuse_connections: bool = False,
     ) -> None:
         self.state = state
         self.fail_connect_times = fail_connect_times
         self.fail_commit_times = fail_commit_times
         self.commit_drops_after_apply = commit_drops_after_apply
+        self.reuse_connections = reuse_connections
+        self._reusable_conn: _FakeConnection | None = None
         self.connect_calls = 0
         self.fail_commit_calls = 0
         self.opened = False
@@ -586,6 +624,11 @@ class _FakePool:
                 if pool.connect_calls <= pool.fail_connect_times:
                     err_cls = TRANSIENT_ERRORS[0]
                     raise err_cls("Simulated transient connection failure")
+                if pool.reuse_connections:
+                    if pool._reusable_conn is None:
+                        pool._reusable_conn = _FakeConnection(pool.state, pool=pool)
+                        pool.connections.append(pool._reusable_conn)
+                    return pool._reusable_conn
                 conn = _FakeConnection(pool.state, pool=pool)
                 pool.connections.append(conn)
                 return conn
@@ -962,6 +1005,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             winner_attempt_id = winners[0]["attempt_id"]
 
             repo.finalize_processing_attempt(
+                project_id="UTDA_PILOT",
                 event_receipt_id=r1["receipt_id"],
                 idempotency_key="UNAI-TECH/pilot:FEAT-1:blob999:D06",
                 attempt_id=winner_attempt_id,
@@ -1175,6 +1219,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             # Stale worker 1 is rejected on finalize AND renew without altering attempt 2 or fence version
             with self.assertRaises(StaleAttemptError):
                 repo.finalize_processing_attempt(
+                    project_id="UTDA_PILOT",
                     event_receipt_id=None,
                     idempotency_key=idem,
                     attempt_id=att1_id,
@@ -1185,17 +1230,20 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
                 )
             with self.assertRaises(StaleAttemptError):
                 repo.renew_attempt_lease(
+                    project_id="UTDA_PILOT",
                     idempotency_key=idem,
                     attempt_id=att1_id,
                     expected_fence_version=1,
                 )
             with self.assertRaises(StaleAttemptError):
                 repo.renew_attempt_lease(
+                    project_id="UTDA_PILOT",
                     idempotency_key=idem,
                     attempt_id=att2_id,
                     expected_fence_version=1,
                 )
             renewed = repo.renew_attempt_lease(
+                project_id="UTDA_PILOT",
                 idempotency_key=idem,
                 attempt_id=att2_id,
                 expected_fence_version=2,
@@ -1212,13 +1260,19 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 with self.assertRaises(StaleAttemptError):
-                    repo.complete_idempotency_key(idempotency_key=idem, status="COMPLETED")
+                    repo.complete_idempotency_key(
+                        project_id="UTDA_PILOT", idempotency_key=idem, status="COMPLETED"
+                    )
                 with self.assertRaises(StaleAttemptError):
                     repo.complete_idempotency_key(
-                        idempotency_key=idem, status="COMPLETED", attempt_id=att1_id
+                        project_id="UTDA_PILOT",
+                        idempotency_key=idem,
+                        status="COMPLETED",
+                        attempt_id=att1_id,
                     )
                 with self.assertRaises(StaleAttemptError):
                     repo.record_processing_attempt(
+                        project_id="UTDA_PILOT",
                         event_receipt_id=None,
                         idempotency_key=idem,
                         attempt_number=99,
@@ -1230,6 +1284,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             state.fail_sql_substring = "AND active_attempt_id = %s"
             with self.assertRaises(RuntimeError):
                 repo.finalize_processing_attempt(
+                    project_id="UTDA_PILOT",
                     event_receipt_id=None,
                     idempotency_key=idem,
                     attempt_id=att2_id,
@@ -1244,6 +1299,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             # Clear SQL failure and finalize atomically with active attempt_id
             state.fail_sql_substring = None
             repo.finalize_processing_attempt(
+                project_id="UTDA_PILOT",
                 event_receipt_id=None,
                 idempotency_key=idem,
                 attempt_id=att2_id,
@@ -1261,6 +1317,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             # Duplicate finalization even with att2_id is rejected once completed
             with self.assertRaises(StaleAttemptError):
                 repo.finalize_processing_attempt(
+                    project_id="UTDA_PILOT",
                     event_receipt_id=None,
                     idempotency_key=idem,
                     attempt_id=att2_id,
@@ -1303,6 +1360,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             self.assertEqual(rec_claim["attempt_number"], 1)
 
             rec_fin_id = repo.finalize_processing_attempt(
+                project_id="UTDA_PILOT",
                 event_receipt_id=None,
                 idempotency_key="reconcile-idem-1",
                 attempt_id=rec_claim["attempt_id"],
@@ -1863,6 +1921,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 )["claimed"]
             )
             repo.finalize_processing_attempt(
+                project_id="CI_LOCAL_TEST",
                 event_receipt_id=None,
                 idempotency_key="ci-local-test:FEAT-CI:sha1:D06",
                 attempt_id=claim1["attempt_id"],
@@ -2032,6 +2091,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             )
             self.assertTrue(sec_claim["claimed"])
             repo.finalize_processing_attempt(
+                project_id="CI_SEC_TEST",
                 event_receipt_id=receipt["receipt_id"],
                 idempotency_key="ci-sec-idem-1",
                 attempt_id=sec_claim["attempt_id"],
@@ -2374,6 +2434,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             # Stale worker 1 cannot finalize OR renew, and cannot alter fence version
             with self.assertRaises(StaleAttemptError):
                 repo.finalize_processing_attempt(
+                    project_id="CI_CONC_TEST",
                     event_receipt_id=rec["receipt_id"],
                     idempotency_key=idem,
                     attempt_id=att1_id,
@@ -2384,12 +2445,14 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 )
             with self.assertRaises(StaleAttemptError):
                 repo.renew_attempt_lease(
+                    project_id="CI_CONC_TEST",
                     idempotency_key=idem,
                     attempt_id=att1_id,
                     expected_fence_version=1,
                 )
             with self.assertRaises(StaleAttemptError):
                 repo.renew_attempt_lease(
+                    project_id="CI_CONC_TEST",
                     idempotency_key=idem,
                     attempt_id=att2_id,
                     expected_fence_version=1,
@@ -2407,6 +2470,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             def _race_renew(worker_idx: int) -> str:
                 if worker_idx % 2 == 0:
                     res = repo.renew_attempt_lease(
+                        project_id="CI_CONC_TEST",
                         idempotency_key=idem,
                         attempt_id=att2_id,
                         expected_fence_version=2,
@@ -2415,6 +2479,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     return f"ok:{res['fence_version']}"
                 try:
                     repo.renew_attempt_lease(
+                        project_id="CI_CONC_TEST",
                         idempotency_key=idem,
                         attempt_id=att1_id,
                         expected_fence_version=1,
@@ -2429,6 +2494,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
 
             # Active worker 2 lease renewal with matching attempt_id & fence_version atomically extends expiry
             ren_ok = repo.renew_attempt_lease(
+                project_id="CI_CONC_TEST",
                 idempotency_key=idem,
                 attempt_id=att2_id,
                 expected_fence_version=2,
@@ -2495,6 +2561,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             db._pool.connection = _drop_once_conn  # type: ignore[method-assign]
             try:
                 fin_res = repo.finalize_processing_attempt(
+                    project_id="CI_CONC_TEST",
                     event_receipt_id=rec["receipt_id"],
                     idempotency_key=idem,
                     attempt_id=att2_id,
@@ -2510,6 +2577,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             # Stale attempt or already-completed attempt cannot finalize or renew again
             with self.assertRaises(StaleAttemptError):
                 repo.finalize_processing_attempt(
+                    project_id="CI_CONC_TEST",
                     event_receipt_id=rec["receipt_id"],
                     idempotency_key=idem,
                     attempt_id=att2_id,
@@ -2519,6 +2587,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 )
             with self.assertRaises(StaleAttemptError):
                 repo.renew_attempt_lease(
+                    project_id="CI_CONC_TEST",
                     idempotency_key=idem,
                     attempt_id=att2_id,
                     expected_fence_version=2,
@@ -2557,6 +2626,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             )
             observed_versions.append(c2["fence_version"])
             repo.finalize_processing_attempt(
+                project_id="CI_CONC_TEST",
                 event_receipt_id=rec["receipt_id"],
                 idempotency_key=multi_key,
                 attempt_id=c2["attempt_id"],
@@ -2597,6 +2667,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             self.assertEqual(observed_versions, [1, 2, 3, 4])
 
             repo.finalize_processing_attempt(
+                project_id="CI_CONC_TEST",
                 event_receipt_id=rec["receipt_id"],
                 idempotency_key=multi_key,
                 attempt_id=c4["attempt_id"],
@@ -2644,6 +2715,302 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     (multi_key,),
                 )
                 self.assertEqual(cur.fetchone(), ("COMPLETED", None, 4))
+
+        # Verify real PostgreSQL 16 transaction-local project context lifecycle across commit,
+        # rollback, connection reuse, and global probes.
+        tx_reuse_cfg = DatabaseConfig.from_env(
+            {
+                "UTDA_DATABASE_URL": os.environ["UTDA_TEST_RUNTIME_URL"],
+                "UTDA_DATABASE_POOL_SIZE": "1",
+                **({"UTDA_DATABASE_SSLMODE": os.environ["UTDA_DATABASE_SSLMODE"]} if os.getenv("UTDA_DATABASE_SSLMODE") else {}),
+                **({"UTDA_ALLOW_INSECURE_LOCAL_DB": os.environ["UTDA_ALLOW_INSECURE_LOCAL_DB"]} if os.getenv("UTDA_ALLOW_INSECURE_LOCAL_DB") else {}),
+            }
+        )
+        with DatabaseManager(tx_reuse_cfg) as single_db:
+            single_repo = UTDADatabaseRepository(single_db)
+
+            # 1 & 4. Project A context active inside tx on pool_size=1; record pg_backend_pid()
+            pid_a, inside_ctx = single_db.run_in_project_transaction(
+                "CI_CONC_TEST",
+                lambda c: c.execute(
+                    "SELECT pg_backend_pid(), current_setting('utda.current_project_id', true)"
+                ).fetchone(),
+            )
+            self.assertEqual(inside_ctx, "CI_CONC_TEST")
+
+            # 2 & 5. Reset after successful commit -> unscoped global transaction on SAME backend sees None
+            pid_global_1, after_commit_global = single_db.run_in_transaction(
+                lambda c: c.execute(
+                    "SELECT pg_backend_pid(), NULLIF(current_setting('utda.current_project_id', true), '')"
+                ).fetchone(),
+            )
+            self.assertEqual(pid_global_1, pid_a)
+            self.assertIsNone(after_commit_global)
+
+            # 6. Project A followed directly by Project B on SAME reused pool_size=1 connection
+            pid_b, inside_b = single_db.run_in_project_transaction(
+                "CI_SEC_TEST",
+                lambda c: c.execute(
+                    "SELECT pg_backend_pid(), current_setting('utda.current_project_id', true)"
+                ).fetchone(),
+            )
+            self.assertEqual(pid_b, pid_a)
+            self.assertEqual(inside_b, "CI_SEC_TEST")
+
+            # 3. Context active inside aborted tx and resets on rollback
+            with self.assertRaises(RuntimeError):
+                def _abort_with_ctx(conn) -> None:
+                    self.assertEqual(
+                        conn.execute("SELECT current_setting('utda.current_project_id', true)").fetchone()[0],
+                        "CI_SEC_TEST",
+                    )
+                    raise RuntimeError("abort to verify GUC reset on rollback")
+
+                single_db.run_in_project_transaction("CI_SEC_TEST", _abort_with_ctx)
+
+            pid_global_2, after_rollback_global = single_db.run_readonly(
+                lambda c: c.execute(
+                    "SELECT pg_backend_pid(), NULLIF(current_setting('utda.current_project_id', true), '')"
+                ).fetchone(),
+            )
+            self.assertEqual(pid_global_2, pid_a)
+            self.assertIsNone(after_rollback_global)
+
+            # 7. Transaction retry behavior re-establishes project context cleanly across transient failure
+            retry_counter = {"attempts": 0}
+
+            def _retry_once_op(conn):
+                retry_counter["attempts"] += 1
+                pid_r, val_r = conn.execute(
+                    "SELECT pg_backend_pid(), current_setting('utda.current_project_id', true)"
+                ).fetchone()
+                self.assertEqual(val_r, "CI_CONC_TEST")
+                if retry_counter["attempts"] == 1:
+                    raise psycopg.OperationalError("Simulated transient pre-commit failure on PG16")
+                return pid_r, val_r
+
+            pid_retry, val_retry = single_db.run_in_project_transaction("CI_CONC_TEST", _retry_once_op)
+            self.assertEqual(retry_counter["attempts"], 2)
+            self.assertEqual(pid_retry, pid_a)
+            self.assertEqual(val_retry, "CI_CONC_TEST")
+            self.assertIsNone(
+                single_db.run_readonly(
+                    lambda c: c.execute(
+                        "SELECT NULLIF(current_setting('utda.current_project_id', true), '')"
+                    ).fetchone()[0]
+                )
+            )
+
+            # 8. Invalid or missing project_id fails BEFORE executing any SQL on real PG16
+            for bad_pid in ("", None, "   ", "lowercase", " CI_CONC_TEST "):
+                with self.assertRaises(DatabaseConfigError):
+                    single_repo.get_feature_state(project_id=bad_pid, feature_id="FEAT-CONC")  # type: ignore[arg-type]
+                with self.assertRaises(DatabaseConfigError):
+                    single_db.run_in_project_transaction(bad_pid, lambda _c: None)  # type: ignore[arg-type]
+
+    def test_transaction_local_project_context_and_strict_repo_scoping(self) -> None:
+        state = _FakeDBState()
+        state.tables_initialized = True
+
+        # Valid project_id validation without silent normalization
+        self.assertEqual(validate_project_id("UTDA_PILOT"), "UTDA_PILOT")
+        self.assertEqual(validate_project_id("P01-ALPHA_2"), "P01-ALPHA_2")
+        for bad_pid in ("", None, "   ", "utda_pilot", " UTDA_PILOT", "UTDA_PILOT ", "AB", "bad;id"):
+            with self.assertRaises(DatabaseConfigError):
+                validate_project_id(bad_pid)  # type: ignore[arg-type]
+
+        # Test both Session Pooler (port 5432) and Transaction Pooler (port 6543) configs
+        session_cfg = DatabaseConfig.from_env(
+            {
+                "UTDA_DATABASE_URL": "postgresql://utda_runtime:pw@aws-0-ap-south-1.pooler.supabase.com:5432/postgres",
+            }
+        )
+        tx_cfg = DatabaseConfig.from_env(
+            {
+                "UTDA_DATABASE_URL": "postgresql://utda_runtime:pw@aws-0-ap-south-1.pooler.supabase.com:6543/postgres",
+            }
+        )
+
+        for pool_cfg in (session_cfg, tx_cfg):
+            pool = _FakePool(state, reuse_connections=True)
+            with DatabaseManager(pool_cfg, pool_factory=lambda _c, p=pool: p, sleep_fn=lambda _s: None) as db:
+                repo = UTDADatabaseRepository(db)
+
+                # Invalid & missing project_ids rejected BEFORE acquiring any connection or SQL
+                for bad_pid in ("", None, "   ", "utda_pilot", " UTDA_PILOT "):
+                    with self.assertRaises(DatabaseConfigError):
+                        with db.project_transaction(bad_pid):  # type: ignore[arg-type]
+                            pass
+                    with self.assertRaises(DatabaseConfigError):
+                        db.run_in_project_transaction(bad_pid, lambda _c: None)  # type: ignore[arg-type]
+                    with self.assertRaises(DatabaseConfigError):
+                        db.run_project_readonly(bad_pid, lambda _c: None)  # type: ignore[arg-type]
+                self.assertEqual(pool.connect_calls, 0)
+
+                # Project context set BEFORE repository SQL inside transaction, and resets on commit
+                repo.upsert_project(
+                    project_id="PROJ_ONE",
+                    project_name="Project One",
+                    status="active",
+                    github_owner="UNAI-TECH",
+                    github_repo="proj-one",
+                    default_branch="main",
+                )
+                reused_conn = pool.connections[0]
+                self.assertEqual(len(pool.connections), 1)
+                self.assertIsNone(reused_conn.current_project_id)
+                set_idx = next(
+                    i for i, sql in enumerate(reused_conn.executed_sql) if "set_config('utda.current_project_id'" in sql
+                )
+                insert_idx = next(
+                    i for i, sql in enumerate(reused_conn.executed_sql) if '"projects"' in sql
+                )
+                self.assertLess(set_idx, insert_idx)
+                self.assertIn(("SELECT set_config('utda.current_project_id', %s, true)", ("PROJ_ONE",)), reused_conn.executed_params)
+
+                # Explicit global health probe runs on reused connection without setting project context
+                sql_count_before_health = len(reused_conn.executed_sql)
+                params_count_before_health = len(reused_conn.executed_params)
+                health = check_database_health(db, read_only=True)
+                self.assertEqual(health["status"], "healthy")
+                self.assertEqual(len(reused_conn.executed_params), params_count_before_health)
+                self.assertFalse(
+                    any(
+                        "set_config" in s
+                        for s in reused_conn.executed_sql[sql_count_before_health:]
+                    )
+                )
+                self.assertIsNone(reused_conn.current_project_id)
+
+                # Context active inside rollback tx, and resets to None on rollback
+                with self.assertRaises(RuntimeError):
+                    def _rollback_check(conn) -> None:
+                        cur = conn.cursor()
+                        cur.execute("SELECT current_setting('utda.current_project_id', true)")
+                        self.assertEqual(cur.fetchone()[0], "PROJ_TWO")
+                        raise RuntimeError("force rollback")
+
+                    db.run_in_transaction(_rollback_check, project_id="PROJ_TWO")
+                self.assertIsNone(reused_conn.current_project_id)
+
+                # Subsequent global transaction on SAME reused connection sees clean None context
+                def _global_check(conn) -> str | None:
+                    cur = conn.cursor()
+                    cur.execute("SELECT current_setting('utda.current_project_id', true)")
+                    return cur.fetchone()[0]
+
+                self.assertIsNone(db.run_in_transaction(_global_check))
+                self.assertIsNone(db.run_readonly(_global_check))
+
+        # Every project-scoped repository method rejects omitted (TypeError) & empty/invalid project_id BEFORE SQL
+        fresh_pool = _FakePool(state, reuse_connections=True)
+        with DatabaseManager(session_cfg, pool_factory=lambda _c: fresh_pool, sleep_fn=lambda _s: None) as db:
+            repo = UTDADatabaseRepository(db)
+            omitted_calls = [
+                lambda: repo.upsert_project(
+                    project_name="X", status="active", github_owner="o", github_repo="r", default_branch="main"
+                ),
+                lambda: repo.record_event_receipt(
+                    delivery_id="d1", event_name="push", repository="o/r", feature_id="F1", git_sha="abc1234"
+                ),
+                lambda: repo.correlate_feature_state(feature_id="F1"),
+                lambda: repo.get_feature_state(feature_id="F1"),
+                lambda: repo.claim_idempotency_and_attempt(
+                    idempotency_key="k1", scope="s", feature_id="F1", report_blob_sha="b", target_document_id="D06", event_receipt_id=None
+                ),
+                lambda: repo.finalize_processing_attempt(
+                    event_receipt_id=None, idempotency_key="k1", attempt_id="a1", attempt_status="SUCCEEDED", final_key_status="COMPLETED"
+                ),
+                lambda: repo.renew_attempt_lease(
+                    idempotency_key="k1", attempt_id="a1", expected_fence_version=1
+                ),
+                lambda: repo.record_final_report(
+                    feature_id="F1", feature_name="n", change_type="other", implementation_status="implemented",
+                    report_path="p", report_blob_sha="b", git_commit_sha="abc1234", report_metadata={}, evidence_refs=[]
+                ),
+                lambda: repo.append_audit_event(actor="bot", event_type="EVT"),
+                lambda: repo.acquire_idempotency_key(
+                    idempotency_key="k1", scope="s", feature_id="F1", report_blob_sha="b", target_document_id="D06"
+                ),
+                lambda: repo.next_attempt_number(idempotency_key="k1"),
+                lambda: repo.complete_idempotency_key(idempotency_key="k1", status="COMPLETED", attempt_id="a1"),
+                lambda: repo.record_processing_attempt(
+                    event_receipt_id=None, idempotency_key="k1", attempt_number=1, status="SUCCEEDED"
+                ),
+            ]
+            for fn in omitted_calls:
+                with self.assertRaises(TypeError):
+                    fn()  # type: ignore[call-arg]
+
+            for bad_pid in (None, "", "   ", "proj_lower", " PROJ_ONE "):
+                invalid_calls = [
+                    lambda p=bad_pid: repo.upsert_project(
+                        project_id=p, project_name="X", status="active", github_owner="o", github_repo="r", default_branch="main"
+                    ),
+                    lambda p=bad_pid: repo.record_event_receipt(
+                        delivery_id="d1", event_name="push", repository="o/r", project_id=p, feature_id="F1", git_sha="abc1234"
+                    ),
+                    lambda p=bad_pid: repo.correlate_feature_state(project_id=p, feature_id="F1"),
+                    lambda p=bad_pid: repo.get_feature_state(project_id=p, feature_id="F1"),
+                    lambda p=bad_pid: repo.claim_idempotency_and_attempt(
+                        idempotency_key="k1", scope="s", project_id=p, feature_id="F1", report_blob_sha="b", target_document_id="D06", event_receipt_id=None
+                    ),
+                    lambda p=bad_pid: repo.finalize_processing_attempt(
+                        project_id=p, event_receipt_id=None, idempotency_key="k1", attempt_id="a1", attempt_status="SUCCEEDED", final_key_status="COMPLETED"
+                    ),
+                    lambda p=bad_pid: repo.renew_attempt_lease(
+                        project_id=p, idempotency_key="k1", attempt_id="a1", expected_fence_version=1
+                    ),
+                    lambda p=bad_pid: repo.record_final_report(
+                        project_id=p, feature_id="F1", feature_name="n", change_type="other", implementation_status="implemented",
+                        report_path="p", report_blob_sha="b", git_commit_sha="abc1234", report_metadata={}, evidence_refs=[]
+                    ),
+                    lambda p=bad_pid: repo.append_audit_event(actor="bot", event_type="EVT", project_id=p),
+                ]
+                for fn in invalid_calls:
+                    with self.assertRaises(DatabaseConfigError):
+                        fn()  # type: ignore[arg-type]
+
+            self.assertEqual(fresh_pool.connect_calls, 0)
+
+            # Cross-project mismatch check inside finalize_processing_attempt and renew_attempt_lease
+            claim_p1 = repo.claim_idempotency_and_attempt(
+                idempotency_key="scoped-key-p1",
+                scope="phase2_check",
+                project_id="PROJ_ONE",
+                feature_id="FEAT-1",
+                report_blob_sha="blob1",
+                target_document_id="D06",
+                event_receipt_id=None,
+            )
+            with self.assertRaises(IdempotencyIdentityMismatchError):
+                repo.renew_attempt_lease(
+                    project_id="PROJ_TWO",
+                    idempotency_key="scoped-key-p1",
+                    attempt_id=claim_p1["attempt_id"],
+                    expected_fence_version=1,
+                )
+            with self.assertRaises(IdempotencyIdentityMismatchError):
+                repo.finalize_processing_attempt(
+                    project_id="PROJ_TWO",
+                    event_receipt_id=None,
+                    idempotency_key="scoped-key-p1",
+                    attempt_id=claim_p1["attempt_id"],
+                    attempt_status="SUCCEEDED",
+                    final_key_status="COMPLETED",
+                )
+            # Original PROJ_ONE state remains intact and finalizes cleanly
+            self.assertEqual(state.idempotency_keys["scoped-key-p1"]["status"], "IN_PROGRESS")
+            repo.finalize_processing_attempt(
+                project_id="PROJ_ONE",
+                event_receipt_id=None,
+                idempotency_key="scoped-key-p1",
+                attempt_id=claim_p1["attempt_id"],
+                expected_fence_version=claim_p1["fence_version"],
+                attempt_status="SUCCEEDED",
+                final_key_status="COMPLETED",
+            )
+            self.assertEqual(state.idempotency_keys["scoped-key-p1"]["status"], "COMPLETED")
 
     @unittest.skipUnless(
         os.getenv("UTDA_RUN_LIVE_SUPABASE_TESTS") == "true" and os.getenv("UTDA_DATABASE_URL"),

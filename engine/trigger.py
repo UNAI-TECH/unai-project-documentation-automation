@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from engine.audit_store import AuditStore, make_event_key, make_idempotency_key
 from engine.config_loader import (
     ConfigError,
+    ProjectIdentityError,
     is_dry_run,
     load_local_project_config,
     load_project_registry,
@@ -47,6 +48,7 @@ class NormalizedEvent:
     report_dir: str
     dry_run: bool
     base_sha: str | None = None
+    repository_id: str | None = None
 
 
 def _read_github_event_payload(env: Mapping[str, str]) -> dict[str, Any]:
@@ -68,10 +70,38 @@ def normalize_event(environ: Mapping[str, str] | None = None) -> NormalizedEvent
     payload = _read_github_event_payload(env)
 
     event_name = env.get("GITHUB_EVENT_NAME", "").strip() or "workflow_dispatch"
-    repository = (
-        env.get("GITHUB_REPOSITORY", "").strip()
-        or payload.get("repository", {}).get("full_name", "")
-    )
+    raw_repo = env.get("GITHUB_REPOSITORY")
+    payload_repo_raw = payload.get("repository", {}).get("full_name")
+    payload_repo = str(payload_repo_raw) if payload_repo_raw is not None else ""
+    inputs_obj = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
+
+    if env.get("GITHUB_ACTIONS", "").strip().lower() == "true" and (raw_repo is None or raw_repo == ""):
+        raise ProjectIdentityError(
+            "GITHUB_REPOSITORY environment variable is required inside GitHub Actions; "
+            "falling back to event payload repository is prohibited.",
+            code="ERR_MISSING_TRUSTED_REPOSITORY",
+        )
+
+    if raw_repo is not None and raw_repo != "":
+        if payload_repo and payload_repo.lower() != raw_repo.lower():
+            raise ProjectIdentityError(
+                f"Event payload repository '{payload_repo}' does not match trusted "
+                f"GITHUB_REPOSITORY '{raw_repo}'.",
+                code="ERR_REPOSITORY_PAYLOAD_MISMATCH",
+            )
+        repository = raw_repo
+    else:
+        repository = payload_repo
+
+    input_repo = inputs_obj.get("repository")
+    if isinstance(input_repo, str) and input_repo != "":
+        raise ProjectIdentityError(
+            "Workflow dispatch inputs cannot specify or override repository identity.",
+            code="ERR_UNTRUSTED_DISPATCH_REPOSITORY",
+        )
+
+    raw_repo_id = env.get("GITHUB_REPOSITORY_ID") or str(payload.get("repository", {}).get("id") or "")
+    repository_id = raw_repo_id.strip() or None
     git_sha = validate_git_sha(
         env.get("GITHUB_SHA", "").strip() or "HEAD",
         field_name="GITHUB_SHA",
@@ -109,7 +139,19 @@ def normalize_event(environ: Mapping[str, str] | None = None) -> NormalizedEvent
             if match:
                 feature_id = match.group(1)
                 break
-    project_id = env.get("UTDA_PROJECT_ID", "").strip() or None
+    raw_project_id = env.get("UTDA_PROJECT_ID")
+    input_project_id = inputs_obj.get("project_id")
+    if raw_project_id is not None and raw_project_id != "":
+        if isinstance(input_project_id, str) and input_project_id != "" and raw_project_id != input_project_id:
+            raise ProjectIdentityError(
+                "Event dispatch inputs.project_id disagrees with UTDA_PROJECT_ID.",
+                code="ERR_PROJECT_ID_MISMATCH",
+            )
+        project_id: str | None = raw_project_id
+    elif isinstance(input_project_id, str) and input_project_id != "":
+        project_id = input_project_id
+    else:
+        project_id = None
     report_dir = env.get("UTDA_REPORT_PATH", "").strip() or "documentation/reports/final"
 
     delivery_id = (
@@ -132,6 +174,7 @@ def normalize_event(environ: Mapping[str, str] | None = None) -> NormalizedEvent
         report_dir=report_dir,
         dry_run=is_dry_run(env),
         base_sha=base_sha,
+        repository_id=repository_id,
     )
 
 
@@ -158,11 +201,12 @@ def process_event(
     registry_path = utda_dir / os.getenv("UTDA_REGISTRY_PATH", "config/project_registry.json")
     registry = load_project_registry(registry_path, schemas_dir)
     local_cfg = load_local_project_config(repo_dir, schemas_dir)
-    resolved_project_id = event.project_id or (local_cfg or {}).get("project_id")
+    local_project_id = local_cfg.get("project_id") if local_cfg is not None else None
     project_entry = resolve_project(
         registry,
-        project_id=resolved_project_id,
+        project_id=event.project_id,
         repository=event.repository,
+        local_project_id=local_project_id,
     )
     project_id = project_entry["project_id"]
     audit.sync_project(project_entry)
@@ -340,6 +384,7 @@ def process_event(
     finalized = False
     try:
         audit.record_attempt_outcome(
+            project_id=project_id,
             event_receipt_id=receipt["receipt_id"],
             idempotency_key=idem_key,
             attempt_id=attempt_id,
@@ -353,6 +398,7 @@ def process_event(
         if not finalized:
             try:
                 audit.record_attempt_outcome(
+                    project_id=project_id,
                     event_receipt_id=receipt["receipt_id"],
                     idempotency_key=idem_key,
                     attempt_id=attempt_id,

@@ -12,7 +12,12 @@ import tempfile
 import unittest
 
 from engine.audit_store import AuditStore, make_idempotency_key
-from engine.config_loader import is_dry_run
+from engine.config_loader import (
+    ConfigError,
+    ProjectIdentityError,
+    is_dry_run,
+    resolve_project,
+)
 from engine.database import (
     CommitOutcomeUnknownError,
     DatabaseManager,
@@ -358,6 +363,7 @@ class Phase1EventPipelineTests(unittest.TestCase):
 
             # Simulate transient failure marking key FAILED
             audit.record_attempt_outcome(
+                project_id="UTDA_PILOT",
                 event_receipt_id=None,
                 idempotency_key=idem,
                 attempt_id=str(att1_id),
@@ -993,6 +999,330 @@ class Phase1EventPipelineTests(unittest.TestCase):
                         utda_dir=utda2,
                         audit=AuditStore(repo=UTDADatabaseRepository(dead_db)),
                     )
+
+    def test_authoritative_project_resolution_and_zero_writes_on_failure(self) -> None:
+        registry = {
+            "schema_version": "1.0",
+            "authority_mode": "GITHUB_AUTHORITY",
+            "master_record_scope": "BOTH",
+            "projects": [
+                {
+                    "project_id": "UTDA_PILOT",
+                    "project_name": "Pilot App",
+                    "status": "active",
+                    "github": {
+                        "owner": "UNAI-TECH",
+                        "repo": "pilot-app",
+                        "default_branch": "main",
+                    },
+                    "drive": {"folder_id": "drv-1", "files": {}},
+                },
+                {
+                    "project_id": "OTHER_PROJ",
+                    "project_name": "Other App",
+                    "status": "active",
+                    "github": {
+                        "owner": "UNAI-TECH",
+                        "repo": "other-app",
+                        "default_branch": "main",
+                    },
+                    "drive": {"folder_id": "drv-2", "files": {}},
+                },
+                {
+                    "project_id": "ARCHIVED_APP",
+                    "project_name": "Archived App",
+                    "status": "archived",
+                    "github": {
+                        "owner": "UNAI-TECH",
+                        "repo": "archived-app",
+                        "default_branch": "main",
+                    },
+                    "drive": {"folder_id": "drv-3", "files": {}},
+                },
+            ],
+        }
+
+        # 1. Valid owner/repo resolution (exact + GitHub case-insensitive owner/repo)
+        exact = resolve_project(
+            registry,
+            repository="UNAI-TECH/pilot-app",
+            project_id="UTDA_PILOT",
+            local_project_id="UTDA_PILOT",
+        )
+        self.assertEqual(exact["project_id"], "UTDA_PILOT")
+        case_repo = resolve_project(registry, repository="unai-tech/Pilot-App")
+        self.assertEqual(case_repo["project_id"], "UTDA_PILOT")
+
+        # 2. Caller-supplied foreign project_id cannot override repository ownership
+        with self.assertRaises(ProjectIdentityError) as foreign_ctx:
+            resolve_project(
+                registry,
+                repository="UNAI-TECH/pilot-app",
+                project_id="OTHER_PROJ",
+            )
+        self.assertEqual(foreign_ctx.exception.code, "ERR_PROJECT_ID_MISMATCH")
+
+        # 3. Local project-config mismatch fails closed even if UTDA_PROJECT_ID matches canonical
+        with self.assertRaises(ProjectIdentityError) as local_ctx:
+            resolve_project(
+                registry,
+                repository="UNAI-TECH/pilot-app",
+                project_id="UTDA_PILOT",
+                local_project_id="OTHER_PROJ",
+            )
+        self.assertEqual(local_ctx.exception.code, "ERR_LOCAL_CONFIG_PROJECT_MISMATCH")
+
+        # 4. Unregistered and archived repositories fail closed
+        with self.assertRaises(ProjectIdentityError) as unreg_ctx:
+            resolve_project(registry, repository="UNAI-TECH/unknown-repo")
+        self.assertEqual(unreg_ctx.exception.code, "ERR_PROJECT_NOT_REGISTERED")
+
+        with self.assertRaises(ProjectIdentityError) as arch_ctx:
+            resolve_project(registry, repository="UNAI-TECH/archived-app")
+        self.assertEqual(arch_ctx.exception.code, "ERR_PROJECT_ARCHIVED")
+
+        # 5. Case & whitespace handling: never silently normalize invalid project IDs or whitespace repos
+        for bad_repo in ("", None, " UNAI-TECH/pilot-app", "UNAI-TECH/pilot-app ", "UNAI-TECH / pilot-app", "noslash"):
+            with self.assertRaises(ProjectIdentityError):
+                resolve_project(registry, repository=bad_repo)  # type: ignore[arg-type]
+
+        for bad_pid in ("utda_pilot", " UTDA_PILOT", "UTDA_PILOT ", "   ", "AB", "bad;id"):
+            with self.assertRaises(ProjectIdentityError):
+                resolve_project(
+                    registry,
+                    repository="UNAI-TECH/pilot-app",
+                    project_id=bad_pid,
+                )
+            with self.assertRaises(ProjectIdentityError):
+                resolve_project(
+                    registry,
+                    repository="UNAI-TECH/pilot-app",
+                    local_project_id=bad_pid,
+                )
+
+        # 6. End-to-end zero DB writes on failed resolution (foreign caller ID, local mismatch,
+        #    unregistered repo, archived repo, lowercase/whitespace project IDs) + report mismatch check.
+        def _assert_zero_db_writes(state: _FakeDBState, pool: _FakePool) -> None:
+            self.assertEqual(pool.connect_calls, 0)
+            self.assertEqual(state.projects, {})
+            self.assertEqual(state.receipts_by_delivery, {})
+            self.assertEqual(state.feature_states, {})
+            self.assertEqual(state.final_reports, {})
+            self.assertEqual(state.idempotency_keys, {})
+            self.assertEqual(state.attempts, [])
+            self.assertEqual(state.audit_events, [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _init_temp_git_repo(base)
+            utda = _init_temp_utda_dir(base)
+            (utda / "config" / "project_registry.json").write_text(
+                json.dumps(registry), encoding="utf-8"
+            )
+            sha = _commit_json_report(
+                repo,
+                "FEAT-ISO",
+                {
+                    "project_id": "UTDA_PILOT",
+                    "feature_id": "FEAT-ISO",
+                    "feature_name": "Project Isolation",
+                    "change_type": "security_change",
+                    "summary": "Verify authoritative project resolution.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "iso-1"}],
+                },
+            )
+
+            failure_envs = [
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                    "GITHUB_SHA": sha,
+                    "UTDA_PROJECT_ID": "OTHER_PROJ",
+                    "FEATURE_ID": "FEAT-ISO",
+                    "UTDA_DELIVERY_ID": "deliv-foreign-input",
+                },
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                    "GITHUB_SHA": sha,
+                    "UTDA_PROJECT_ID": "utda_pilot",
+                    "FEATURE_ID": "FEAT-ISO",
+                    "UTDA_DELIVERY_ID": "deliv-lower-input",
+                },
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                    "GITHUB_SHA": sha,
+                    "UTDA_PROJECT_ID": " UTDA_PILOT ",
+                    "FEATURE_ID": "FEAT-ISO",
+                    "UTDA_DELIVERY_ID": "deliv-ws-input",
+                },
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": "UNAI-TECH/not-registered",
+                    "GITHUB_SHA": sha,
+                    "FEATURE_ID": "FEAT-ISO",
+                    "UTDA_DELIVERY_ID": "deliv-unregistered",
+                },
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": "UNAI-TECH/archived-app",
+                    "GITHUB_SHA": sha,
+                    "FEATURE_ID": "FEAT-ISO",
+                    "UTDA_DELIVERY_ID": "deliv-archived",
+                },
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": " UNAI-TECH/pilot-app ",
+                    "GITHUB_SHA": sha,
+                    "FEATURE_ID": "FEAT-ISO",
+                    "UTDA_DELIVERY_ID": "deliv-ws-repo",
+                },
+            ]
+            for env in failure_envs:
+                state = _FakeDBState()
+                state.tables_initialized = True
+                pool = _FakePool(state)
+                with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+                    audit = AuditStore(repo=UTDADatabaseRepository(db))
+                    ev = normalize_event(env)
+                    with self.assertRaises(ProjectIdentityError):
+                        process_event(ev, repo_dir=repo, utda_dir=utda, audit=audit)
+                _assert_zero_db_writes(state, pool)
+
+            # Mutate local project-config.json to mismatched project_id -> ConfigError / ProjectIdentityError, 0 DB writes
+            cfg_file = repo / "documentation" / "project-config.json"
+            orig_cfg_text = cfg_file.read_text(encoding="utf-8")
+            try:
+                cfg_data = json.loads(orig_cfg_text)
+                cfg_data["project_id"] = "OTHER_PROJ"
+                cfg_file.write_text(json.dumps(cfg_data), encoding="utf-8")
+                state = _FakeDBState()
+                state.tables_initialized = True
+                pool = _FakePool(state)
+                with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool, sleep_fn=lambda _s: None) as db:
+                    audit = AuditStore(repo=UTDADatabaseRepository(db))
+                    ev_local_bad = normalize_event(
+                        {
+                            "GITHUB_EVENT_NAME": "push",
+                            "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                            "GITHUB_SHA": sha,
+                            "UTDA_PROJECT_ID": "UTDA_PILOT",
+                            "FEATURE_ID": "FEAT-ISO",
+                            "UTDA_DELIVERY_ID": "deliv-local-mismatch",
+                        }
+                    )
+                    with self.assertRaises(ProjectIdentityError):
+                        process_event(ev_local_bad, repo_dir=repo, utda_dir=utda, audit=audit)
+                _assert_zero_db_writes(state, pool)
+            finally:
+                cfg_file.write_text(orig_cfg_text, encoding="utf-8")
+
+            # Report payload referencing OTHER_PROJ -> VALIDATION_FAILED, zero writes to OTHER_PROJ / final_reports
+            bad_report_sha = _commit_json_report(
+                repo,
+                "FEAT-SPOOF",
+                {
+                    "project_id": "OTHER_PROJ",
+                    "feature_id": "FEAT-SPOOF",
+                    "feature_name": "Spoofed Report Project",
+                    "change_type": "security_change",
+                    "summary": "Report claims OTHER_PROJ from pilot-app repo.",
+                    "implementation_status": "implemented",
+                    "evidence": [{"kind": "commit", "reference": "spoof-1"}],
+                },
+            )
+            state_rep = _FakeDBState()
+            state_rep.tables_initialized = True
+            pool_rep = _FakePool(state_rep)
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool_rep, sleep_fn=lambda _s: None) as db:
+                audit_rep = AuditStore(repo=UTDADatabaseRepository(db))
+                ev_rep = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "push",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_SHA": bad_report_sha,
+                        "FEATURE_ID": "FEAT-SPOOF",
+                        "UTDA_DELIVERY_ID": "deliv-report-spoof",
+                    }
+                )
+                res_rep = process_event(ev_rep, repo_dir=repo, utda_dir=utda, audit=audit_rep)
+            self.assertEqual(res_rep["status"], "VALIDATION_FAILED")
+            self.assertEqual(res_rep["project_id"], "UTDA_PILOT")
+            self.assertTrue(any("project_id mismatch" in e for e in res_rep["errors"]))
+            self.assertEqual(state_rep.final_reports, {})
+            self.assertEqual(state_rep.idempotency_keys, {})
+            self.assertNotIn("OTHER_PROJ", state_rep.projects)
+            self.assertFalse(any(k[0] == "OTHER_PROJ" for k in state_rep.feature_states))
+
+            # 7. Untrusted event payload / dispatch spoofing protections
+            spoof_repo_payload = base / "spoof_repo_event.json"
+            spoof_repo_payload.write_text(
+                json.dumps({"repository": {"full_name": "UNAI-TECH/other-app"}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ProjectIdentityError) as mismatch_ctx:
+                normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "push",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_EVENT_PATH": str(spoof_repo_payload),
+                        "GITHUB_SHA": sha,
+                    }
+                )
+            self.assertEqual(mismatch_ctx.exception.code, "ERR_REPOSITORY_PAYLOAD_MISMATCH")
+
+            # Inside GitHub Actions, missing GITHUB_REPOSITORY refuses payload fallback
+            with self.assertRaises(ProjectIdentityError) as actions_ctx:
+                normalize_event(
+                    {
+                        "GITHUB_ACTIONS": "true",
+                        "GITHUB_EVENT_NAME": "push",
+                        "GITHUB_EVENT_PATH": str(spoof_repo_payload),
+                        "GITHUB_SHA": sha,
+                    }
+                )
+            self.assertEqual(actions_ctx.exception.code, "ERR_MISSING_TRUSTED_REPOSITORY")
+
+            # Dispatch inputs attempting to override repository or foreign project_id fail closed
+            spoof_dispatch_repo = base / "spoof_dispatch_repo.json"
+            spoof_dispatch_repo.write_text(
+                json.dumps({"inputs": {"feature_id": "FEAT-ISO", "repository": "UNAI-TECH/other-app"}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ProjectIdentityError) as disp_repo_ctx:
+                normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "workflow_dispatch",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_EVENT_PATH": str(spoof_dispatch_repo),
+                        "GITHUB_SHA": sha,
+                    }
+                )
+            self.assertEqual(disp_repo_ctx.exception.code, "ERR_UNTRUSTED_DISPATCH_REPOSITORY")
+
+            spoof_dispatch_pid = base / "spoof_dispatch_pid.json"
+            spoof_dispatch_pid.write_text(
+                json.dumps({"inputs": {"feature_id": "FEAT-ISO", "project_id": "OTHER_PROJ"}}),
+                encoding="utf-8",
+            )
+            state_disp = _FakeDBState()
+            state_disp.tables_initialized = True
+            pool_disp = _FakePool(state_disp)
+            with DatabaseManager(self._cfg(), pool_factory=lambda _c: pool_disp, sleep_fn=lambda _s: None) as db:
+                audit_disp = AuditStore(repo=UTDADatabaseRepository(db))
+                ev_disp = normalize_event(
+                    {
+                        "GITHUB_EVENT_NAME": "workflow_dispatch",
+                        "GITHUB_REPOSITORY": "UNAI-TECH/pilot-app",
+                        "GITHUB_EVENT_PATH": str(spoof_dispatch_pid),
+                        "GITHUB_SHA": sha,
+                    }
+                )
+                with self.assertRaises(ProjectIdentityError):
+                    process_event(ev_disp, repo_dir=repo, utda_dir=utda, audit=audit_disp)
+            _assert_zero_db_writes(state_disp, pool_disp)
 
 
 if __name__ == "__main__":

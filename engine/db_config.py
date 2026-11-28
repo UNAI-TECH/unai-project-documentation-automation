@@ -36,10 +36,21 @@ SECURE_SSL_MODES = ("require", "verify-ca", "verify-full")
 LOCAL_INSECURE_SSL_MODES = ("disable", "allow", "prefer")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 SCHEMA_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+PROJECT_ID_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{2,31}$")
 
 
 class DatabaseConfigError(ValueError):
     """Raised when database configuration is missing, unsafe, or invalid."""
+
+
+def validate_project_id(project_id: str, *, field_name: str = "project_id") -> str:
+    """Strictly validate a canonical UTDA project_id without silent normalization."""
+    if not isinstance(project_id, str) or not PROJECT_ID_RE.fullmatch(project_id):
+        raise DatabaseConfigError(
+            f"Invalid {field_name}: must be a non-empty canonical identifier matching "
+            "^[A-Z0-9][A-Z0-9_-]{2,31}$ without leading/trailing whitespace."
+        )
+    return project_id
 
 
 def validate_identifier(name: str, kind: str = "identifier") -> str:
