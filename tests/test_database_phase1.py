@@ -3109,14 +3109,21 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     self.assertEqual(cur.fetchone(), (False,), f"Global table {global_tbl} should not have RLS")
 
         # 1. Verify isolated upgrade 0001..0004 -> broken 0005 rollback -> clean 0005 apply & re-run
+        rls_upg_base = DatabaseConfig.from_migration_env(
+            {
+                **os.environ,
+                "UTDA_DATABASE_URL": os.environ["UTDA_TEST_DATABASE_URL"],
+                "UTDA_MIGRATION_DATABASE_URL": os.environ["UTDA_TEST_MIGRATOR_URL"],
+            }
+        )
         rls_upg_cfg = DatabaseConfig(
-            dsn=migrator_cfg.dsn,
-            migration_dsn=migrator_cfg.migration_dsn,
+            dsn=rls_upg_base.dsn,
+            migration_dsn=rls_upg_base.migration_dsn,
             schema="utda_rls_upgrade_test",
-            pool_mode=migrator_cfg.pool_mode,
-            migration_pool_mode=migrator_cfg.migration_pool_mode,
-            sslmode=migrator_cfg.sslmode,
-            migration_sslmode=migrator_cfg.migration_sslmode,
+            pool_mode=rls_upg_base.pool_mode,
+            migration_pool_mode=rls_upg_base.migration_pool_mode,
+            sslmode=rls_upg_base.sslmode,
+            migration_sslmode=rls_upg_base.migration_sslmode,
         )
         with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as adm:
             with adm.cursor() as cur:
