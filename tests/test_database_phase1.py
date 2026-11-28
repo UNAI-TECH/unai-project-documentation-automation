@@ -778,15 +778,30 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             self.assertEqual(pool.connections[-1].rolled_back, 1)
 
     def test_migrations_empty_db_upgrade_checksum_and_rollback(self) -> None:
+        from engine.migrations.runner import _rewrite_schema_prefix
+
         state = _FakeDBState()
         cfg = self._cfg()
         discovered = discover_migrations(MIGRATIONS_DIR)
-        self.assertEqual([m.version for m in discovered], ["0001", "0002", "0003", "0004"])
+        self.assertEqual([m.version for m in discovered], ["0001", "0002", "0003", "0004", "0005"])
         orig_0003 = next(m for m in discovered if m.version == "0003")
         self.assertEqual(
             orig_0003.checksum_sha256,
             "0161daaebb55dec4f6f1f600f5c76ca4dcd0e5e3abab2c392b5ab6f18c6d6d1b",
         )
+        m0004 = next(m for m in discovered if m.version == "0004")
+        self.assertEqual(
+            m0004.checksum_sha256,
+            "7060f50e1820b12194c21cac19c0505454d2a7527c941aac4917e2d2032567ad",
+        )
+        m0005 = next(m for m in discovered if m.version == "0005")
+        self.assertIn("ENABLE ROW LEVEL SECURITY", m0005.sql)
+        self.assertNotIn("GRANT ", m0005.sql)
+        self.assertNotIn("FORCE ROW LEVEL SECURITY", m0005.sql)
+        rewritten_0005 = _rewrite_schema_prefix(m0005.sql, "utda_custom_schema")
+        self.assertIn('"utda_custom_schema".projects', rewritten_0005)
+        self.assertIn("'utda.current_project_id'", rewritten_0005)
+        self.assertIn("'utda.governance_scope'", rewritten_0005)
 
         # Plan on empty DB shows all pending
         plan = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=True, connect_fn=lambda _c: _FakeConnection(state))
@@ -797,6 +812,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
                 "0002_roles_and_indexes",
                 "0003_idempotency_fencing",
                 "0004_idempotency_fence_version_hardening",
+                "0005_project_row_level_security",
             ],
         )
 
@@ -809,6 +825,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
                 "0002_roles_and_indexes",
                 "0003_idempotency_fencing",
                 "0004_idempotency_fence_version_hardening",
+                "0005_project_row_level_security",
             ],
         )
 
@@ -816,14 +833,14 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
         res2 = apply_migrations(cfg, MIGRATIONS_DIR, dry_run=False, connect_fn=lambda _c: _FakeConnection(state))
         self.assertEqual(res2["applied"], [])
 
-        # Simulate upgrade with a 0005 migration in a temp directory + failure rollback
+        # Simulate upgrade with a 0006 migration in a temp directory + failure rollback
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             for m in discovered:
                 (tmp_dir / m.path.name).write_text(m.sql, encoding="utf-8")
-            (tmp_dir / "0005_add_sample.sql").write_text("SELECT 1;", encoding="utf-8")
+            (tmp_dir / "0006_add_sample.sql").write_text("SELECT 1;", encoding="utf-8")
             res3 = apply_migrations(cfg, tmp_dir, dry_run=False, connect_fn=lambda _c: _FakeConnection(state))
-            self.assertEqual(res3["applied"], ["0005_add_sample"])
+            self.assertEqual(res3["applied"], ["0006_add_sample"])
 
             # Altering already-applied 0001 raises checksum mismatch
             (tmp_dir / "0001_initial_utda_schema.sql").write_text("-- tampered", encoding="utf-8")
@@ -1455,7 +1472,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             tmp_dir = Path(tmp)
             for m in discover_migrations(MIGRATIONS_DIR):
                 (tmp_dir / m.path.name).write_text(m.sql, encoding="utf-8")
-            (tmp_dir / "0005_broken.sql").write_text(
+            (tmp_dir / "0006_broken.sql").write_text(
                 "CREATE TABLE utda.should_not_exist (id INT); THIS IS INVALID SQL;",
                 encoding="utf-8",
             )
@@ -1526,7 +1543,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             migration_sslmode=cfg.migration_sslmode,
         )
         dry_plan = apply_migrations(dry_cfg, MIGRATIONS_DIR, dry_run=True)
-        self.assertEqual(len(dry_plan["pending"]), 4)
+        self.assertEqual(len(dry_plan["pending"]), 5)
         with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as chk:
             with chk.cursor() as cur:
                 cur.execute(
@@ -2146,9 +2163,10 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                         cur.execute(stmt)
                 rconn.rollback()
 
-        # 3. Separately controlled utda_governance role
+        # 3. Separately controlled utda_governance role (under CI_SEC_TEST project RLS context)
         with psycopg.connect(gov_cfg.dsn, **gov_cfg.connect_kwargs()) as gconn:
             with gconn.cursor() as cur:
+                cur.execute("SELECT set_config('utda.current_project_id', 'CI_SEC_TEST', true)")
                 cur.execute("SELECT COUNT(*) FROM utda.approval_records")
                 cur.execute("SELECT COUNT(*) FROM utda.rollback_operations")
                 cur.execute(
@@ -2173,7 +2191,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     "UPDATE utda.rollback_operations SET status = 'COMPLETED' WHERE rollback_id = 'gov-r1'"
                 )
                 cur.execute(
-                    "INSERT INTO utda.audit_events (event_id, actor, event_type) VALUES ('gov-ev-1', 'utda_governance', 'APPROVAL_RECORDED')"
+                    "INSERT INTO utda.audit_events (event_id, actor, event_type, project_id) VALUES ('gov-ev-1', 'utda_governance', 'APPROVAL_RECORDED', 'CI_SEC_TEST')"
                 )
             gconn.commit()
 
@@ -3011,6 +3029,460 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 final_key_status="COMPLETED",
             )
             self.assertEqual(state.idempotency_keys["scoped-key-p1"]["status"], "COMPLETED")
+
+    @unittest.skipUnless(
+        os.getenv("UTDA_TEST_DATABASE_URL")
+        and os.getenv("UTDA_TEST_RUNTIME_URL")
+        and os.getenv("UTDA_TEST_MIGRATOR_URL")
+        and os.getenv("UTDA_TEST_GOVERNANCE_URL"),
+        "PG16 RLS isolation tests require CI role DSNs (runs in ci-database.yml)",
+    )
+    def test_real_postgres_row_level_security_and_cross_project_isolation(self) -> None:
+        import psycopg
+
+        admin_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_DATABASE_URL")
+        runtime_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_RUNTIME_URL")
+        migrator_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_MIGRATOR_URL")
+        gov_cfg = DatabaseConfig.from_env(dsn_var="UTDA_TEST_GOVERNANCE_URL")
+
+        rls_tables = (
+            "projects",
+            "project_provisioning_runs",
+            "github_event_receipts",
+            "feature_processing_states",
+            "final_reports",
+            "idempotency_keys",
+            "processing_attempts",
+            "document_proposals",
+            "approval_records",
+            "project_master_versions",
+            "company_aggregation_runs",
+            "drive_file_mappings",
+            "drive_sync_revisions",
+            "rollback_operations",
+            "audit_events",
+        )
+
+        # 0. Verify role attributes, ownership separation, and RLS table flags (enabled, NOT forced)
+        with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as aconn:
+            with aconn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT rolname, rolsuper, rolbypassrls, rolinherit
+                    FROM pg_roles
+                    WHERE rolname IN ('utda_runtime', 'utda_governance')
+                    ORDER BY rolname
+                    """
+                )
+                self.assertEqual(
+                    cur.fetchall(),
+                    [
+                        ("utda_governance", False, False, False),
+                        ("utda_runtime", False, False, False),
+                    ],
+                )
+                for tbl in rls_tables:
+                    cur.execute(
+                        """
+                        SELECT c.relrowsecurity, c.relforcerowsecurity, pg_get_userbyid(c.relowner)
+                        FROM pg_class c
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'utda' AND c.relname = %s
+                        """,
+                        (tbl,),
+                    )
+                    self.assertEqual(cur.fetchone(), (True, False, "utda_migrator"), f"RLS state mismatch on {tbl}")
+                for global_tbl in ("schema_migrations", "template_releases"):
+                    cur.execute(
+                        """
+                        SELECT c.relrowsecurity
+                        FROM pg_class c
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'utda' AND c.relname = %s
+                        """,
+                        (global_tbl,),
+                    )
+                    self.assertEqual(cur.fetchone(), (False,), f"Global table {global_tbl} should not have RLS")
+
+        # 1. Verify isolated upgrade 0001..0004 -> broken 0005 rollback -> clean 0005 apply & re-run
+        rls_upg_cfg = DatabaseConfig(
+            dsn=migrator_cfg.dsn,
+            migration_dsn=migrator_cfg.migration_dsn,
+            schema="utda_rls_upgrade_test",
+            pool_mode=migrator_cfg.pool_mode,
+            migration_pool_mode=migrator_cfg.migration_pool_mode,
+            sslmode=migrator_cfg.sslmode,
+            migration_sslmode=migrator_cfg.migration_sslmode,
+        )
+        with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as adm:
+            with adm.cursor() as cur:
+                cur.execute("CREATE SCHEMA IF NOT EXISTS utda_rls_upgrade_test AUTHORIZATION utda_migrator")
+            adm.commit()
+        try:
+            with tempfile.TemporaryDirectory() as utmp:
+                udir = Path(utmp)
+                for m in discover_migrations(MIGRATIONS_DIR):
+                    if m.version in ("0001", "0002", "0003", "0004"):
+                        (udir / m.path.name).write_text(m.sql, encoding="utf-8")
+                apply_migrations(rls_upg_cfg, udir, dry_run=False)
+
+                (udir / "0005_project_row_level_security.sql").write_text(
+                    "ALTER TABLE utda.projects ENABLE ROW LEVEL SECURITY; INVALID SQL;",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(MigrationError):
+                    apply_migrations(rls_upg_cfg, udir, dry_run=False)
+                with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as chk:
+                    with chk.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT c.relrowsecurity
+                            FROM pg_class c
+                            JOIN pg_namespace n ON n.oid = c.relnamespace
+                            WHERE n.nspname = 'utda_rls_upgrade_test' AND c.relname = 'projects'
+                            """
+                        )
+                        self.assertFalse(cur.fetchone()[0])
+
+                real_0005 = next(m for m in discover_migrations(MIGRATIONS_DIR) if m.version == "0005")
+                (udir / "0005_project_row_level_security.sql").write_text(real_0005.sql, encoding="utf-8")
+                rec05 = apply_migrations(rls_upg_cfg, udir, dry_run=False)
+                self.assertEqual(rec05["applied"], ["0005_project_row_level_security"])
+                self.assertEqual(apply_migrations(rls_upg_cfg, udir, dry_run=True)["pending"], [])
+                self.assertEqual(apply_migrations(rls_upg_cfg, udir, dry_run=False)["applied"], [])
+        finally:
+            with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as adm:
+                with adm.cursor() as cur:
+                    cur.execute("DROP SCHEMA IF EXISTS utda_rls_upgrade_test CASCADE")
+                adm.commit()
+
+        # 2. Seed two isolated projects (RLS_PROJ_A, RLS_PROJ_B) plus NULL/COMPANY_MASTER rows via owner utda_migrator
+        with psycopg.connect(migrator_cfg.dsn, **migrator_cfg.connect_kwargs(for_migration=True)) as mconn:
+            with mconn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO utda.projects (project_id, project_name, status, github_owner, github_repo, default_branch)
+                    VALUES
+                        ('RLS_PROJ_A', 'RLS Project A', 'active', 'UNAI-TECH', 'rls-a', 'main'),
+                        ('RLS_PROJ_B', 'RLS Project B', 'active', 'UNAI-TECH', 'rls-b', 'main')
+                    ON CONFLICT (project_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.github_event_receipts (receipt_id, delivery_id, event_name, repository, project_id, feature_id, git_sha)
+                    VALUES
+                        ('rls-rec-a', 'rls-deliv-a', 'push', 'UNAI-TECH/rls-a', 'RLS_PROJ_A', 'FEAT-A', 'shaA'),
+                        ('rls-rec-b', 'rls-deliv-b', 'push', 'UNAI-TECH/rls-b', 'RLS_PROJ_B', 'FEAT-B', 'shaB'),
+                        ('rls-rec-null', 'rls-deliv-null', 'push', 'UNAI-TECH/orphan', NULL, 'FEAT-N', 'shaN')
+                    ON CONFLICT (receipt_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.feature_processing_states (state_id, project_id, feature_id, status)
+                    VALUES
+                        ('rls-st-a', 'RLS_PROJ_A', 'FEAT-A', 'READY'),
+                        ('rls-st-b', 'RLS_PROJ_B', 'FEAT-B', 'READY')
+                    ON CONFLICT (state_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.final_reports (
+                        report_id, project_id, feature_id, feature_name, change_type,
+                        implementation_status, report_path, report_blob_sha, git_commit_sha, report_metadata
+                    ) VALUES
+                        ('rls-rep-a', 'RLS_PROJ_A', 'FEAT-A', 'FA', 'api_change', 'implemented', 'p/a.json', 'blobA', 'shaA', '{}'::jsonb),
+                        ('rls-rep-b', 'RLS_PROJ_B', 'FEAT-B', 'FB', 'api_change', 'implemented', 'p/b.json', 'blobB', 'shaB', '{}'::jsonb)
+                    ON CONFLICT (report_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.idempotency_keys (
+                        idempotency_key, scope, project_id, feature_id, report_blob_sha, target_document_id, status, attempt_fence_version
+                    ) VALUES
+                        ('rls-key-a', 'phase1', 'RLS_PROJ_A', 'FEAT-A', 'blobA', 'D06', 'COMPLETED', 1),
+                        ('rls-key-b', 'phase1', 'RLS_PROJ_B', 'FEAT-B', 'blobB', 'D06', 'IN_PROGRESS', 1)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.processing_attempts (attempt_id, idempotency_key, attempt_number, status)
+                    VALUES
+                        ('rls-att-a', 'rls-key-a', 1, 'SUCCEEDED'),
+                        ('rls-att-b', 'rls-key-b', 1, 'IN_PROGRESS')
+                    ON CONFLICT (attempt_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.document_proposals (
+                        proposal_id, project_id, feature_id, document_id, section_id, change_id, approval_class
+                    ) VALUES
+                        ('rls-prop-a', 'RLS_PROJ_A', 'FEAT-A', 'D06', 'API', 'C-A', 'routine'),
+                        ('rls-prop-b', 'RLS_PROJ_B', 'FEAT-B', 'D06', 'API', 'C-B', 'routine')
+                    ON CONFLICT (proposal_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.approval_records (
+                        approval_id, project_id, document_id, section_id, change_id,
+                        approver_identity, approver_role, decision, evidence_reference
+                    ) VALUES
+                        ('rls-app-a', 'RLS_PROJ_A', 'D06', 'API', 'C-A', 'cto@unai.tech', 'cto_or_tech_lead', 'approved', 'pr:1'),
+                        ('rls-app-b', 'RLS_PROJ_B', 'D06', 'API', 'C-B', 'cto@unai.tech', 'cto_or_tech_lead', 'approved', 'pr:2')
+                    ON CONFLICT (approval_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.project_master_versions (
+                        master_version_id, project_id, commit_sha, docx_sha256, eligible_for_aggregation
+                    ) VALUES
+                        ('rls-mv-a', 'RLS_PROJ_A', 'mshaA', 'dhashA', TRUE),
+                        ('rls-mv-b-ok', 'RLS_PROJ_B', 'mshaB1', 'dhashB1', TRUE),
+                        ('rls-mv-b-no', 'RLS_PROJ_B', 'mshaB2', 'dhashB2', FALSE)
+                    ON CONFLICT (master_version_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.company_aggregation_runs (
+                        aggregation_id, idempotency_key, source_project_id, source_master_version_id, source_commit_sha, status
+                    ) VALUES ('rls-agg-1', 'rls-agg-idem-1', 'RLS_PROJ_B', 'rls-mv-b-ok', 'mshaB1', 'COMPLETED')
+                    ON CONFLICT (aggregation_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.drive_file_mappings (
+                        mapping_id, project_id, document_id, github_repository, github_path, drive_file_id, drive_folder_id
+                    ) VALUES
+                        ('rls-dm-a', 'RLS_PROJ_A', 'D06', 'UNAI-TECH/rls-a', 'docs/06.docx', 'gdf-a', 'gfold-a'),
+                        ('rls-dm-b', 'RLS_PROJ_B', 'D06', 'UNAI-TECH/rls-b', 'docs/06.docx', 'gdf-b', 'gfold-b'),
+                        ('rls-dm-comp', NULL, 'COMPANY_MASTER', 'UNAI-TECH/unai-company-master-record', 'Master Record.docx', 'gdf-comp', 'gfold-comp')
+                    ON CONFLICT (mapping_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.drive_sync_revisions (sync_id, mapping_id, github_commit_sha, github_sha256, sync_status)
+                    VALUES
+                        ('rls-ds-a', 'rls-dm-a', 'shaA', 'hA', 'SYNCED'),
+                        ('rls-ds-b', 'rls-dm-b', 'shaB', 'hB', 'SYNCED'),
+                        ('rls-ds-comp', 'rls-dm-comp', 'shaC', 'hC', 'SYNCED')
+                    ON CONFLICT (sync_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.rollback_operations (
+                        rollback_id, project_id, document_id, target_scope, restored_from_ref, restored_sha256, operator_identity, status
+                    ) VALUES
+                        ('rls-rb-a', 'RLS_PROJ_A', 'D06', 'GITHUB', 'refA', 'shaA', 'adm@unai.tech', 'COMPLETED'),
+                        ('rls-rb-b', 'RLS_PROJ_B', 'D06', 'GITHUB', 'refB', 'shaB', 'adm@unai.tech', 'COMPLETED'),
+                        ('rls-rb-comp', NULL, 'COMPANY_MASTER', 'DRIVE', 'refC', 'shaC', 'adm@unai.tech', 'COMPLETED')
+                    ON CONFLICT (rollback_id) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO utda.audit_events (event_id, actor, event_type, project_id)
+                    VALUES
+                        ('rls-ev-a', 'seed', 'EVT_A', 'RLS_PROJ_A'),
+                        ('rls-ev-b', 'seed', 'EVT_B', 'RLS_PROJ_B'),
+                        ('rls-ev-null', 'seed', 'EVT_NULL', NULL)
+                    ON CONFLICT (event_id) DO NOTHING
+                    """
+                )
+            mconn.commit()
+
+        # 3. Runtime (utda_runtime) RLS verification (items 1-7, 9-11)
+        with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as rconn:
+            # 6 & 7: Missing and invalid project contexts fail closed
+            for bad_ctx in (None, "", "   ", "rls_proj_a", " RLS_PROJ_A "):
+                with rconn.cursor() as cur:
+                    if bad_ctx is not None:
+                        cur.execute("SELECT set_config('utda.current_project_id', %s, true)", (bad_ctx,))
+                    for tbl in rls_tables:
+                        cur.execute(f"SELECT COUNT(*) FROM utda.{tbl}")
+                        self.assertEqual(cur.fetchone()[0], 0, f"Unset/invalid ctx {bad_ctx!r} leaked rows from {tbl}")
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                        cur.execute(
+                            "INSERT INTO utda.audit_events (event_id, actor, event_type, project_id) VALUES ('bad-ins', 'rt', 'E', 'RLS_PROJ_A')"
+                        )
+                rconn.rollback()
+
+            # 1 & 2: Under RLS_PROJ_A, runtime reads only A's permitted rows and 0 of B's / NULL / COMPANY_MASTER
+            with rconn.cursor() as cur:
+                cur.execute("SELECT set_config('utda.current_project_id', 'RLS_PROJ_A', true)")
+                cur.execute("SELECT project_id FROM utda.projects")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["RLS_PROJ_A"])
+                cur.execute("SELECT receipt_id FROM utda.github_event_receipts")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-rec-a"])
+                cur.execute("SELECT state_id FROM utda.feature_processing_states")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-st-a"])
+                cur.execute("SELECT report_id FROM utda.final_reports")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-rep-a"])
+                cur.execute("SELECT idempotency_key FROM utda.idempotency_keys")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-key-a"])
+                cur.execute("SELECT attempt_id FROM utda.processing_attempts")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-att-a"])
+                cur.execute("SELECT proposal_id FROM utda.document_proposals")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-prop-a"])
+                cur.execute("SELECT approval_id FROM utda.approval_records")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-app-a"])
+                cur.execute("SELECT master_version_id FROM utda.project_master_versions")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-mv-a"])
+                cur.execute("SELECT mapping_id FROM utda.drive_file_mappings")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-dm-a"])
+                cur.execute("SELECT sync_id FROM utda.drive_sync_revisions")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-ds-a"])
+                cur.execute("SELECT rollback_id FROM utda.rollback_operations")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-rb-a"])
+                cur.execute("SELECT event_id FROM utda.audit_events")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-ev-a"])
+                # 10: Company-wide aggregation completely invisible even if runtime tries setting governance_scope
+                cur.execute("SELECT set_config('utda.governance_scope', 'COMPANY_AGGREGATION', true)")
+                cur.execute("SELECT COUNT(*) FROM utda.company_aggregation_runs")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("SELECT COUNT(*) FROM utda.drive_file_mappings WHERE project_id IS NULL")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("SELECT COUNT(*) FROM utda.project_master_versions WHERE project_id = 'RLS_PROJ_B'")
+                self.assertEqual(cur.fetchone()[0], 0)
+                # Global metadata table remains readable without RLS interference
+                cur.execute("SELECT COUNT(*) FROM utda.schema_migrations")
+                self.assertGreaterEqual(cur.fetchone()[0], 5)
+            rconn.rollback()
+
+            # 3 & 9 & 11: Runtime under RLS_PROJ_A cannot INSERT for B, NULL, or B's child attempt
+            cross_inserts = [
+                "INSERT INTO utda.projects (project_id, project_name, status, github_owner, github_repo, default_branch) VALUES ('RLS_PROJ_C', 'X', 'active', 'o', 'r', 'main')",
+                "INSERT INTO utda.github_event_receipts (receipt_id, delivery_id, event_name, repository, project_id, git_sha) VALUES ('x1', 'dx1', 'push', 'o/r', 'RLS_PROJ_B', 'abc')",
+                "INSERT INTO utda.github_event_receipts (receipt_id, delivery_id, event_name, repository, project_id, git_sha) VALUES ('x2', 'dx2', 'push', 'o/r', NULL, 'abc')",
+                "INSERT INTO utda.feature_processing_states (state_id, project_id, feature_id, status) VALUES ('xs1', 'RLS_PROJ_B', 'F', 'READY')",
+                "INSERT INTO utda.final_reports (report_id, project_id, feature_id, feature_name, change_type, implementation_status, report_path, report_blob_sha, git_commit_sha, report_metadata) VALUES ('xr1', 'RLS_PROJ_B', 'F', 'n', 'api_change', 'implemented', 'p', 'b', 'c', '{}'::jsonb)",
+                "INSERT INTO utda.idempotency_keys (idempotency_key, scope, project_id, feature_id, report_blob_sha, target_document_id, status) VALUES ('xk1', 's', 'RLS_PROJ_B', 'F', 'b', 'D06', 'IN_PROGRESS')",
+                "INSERT INTO utda.processing_attempts (attempt_id, idempotency_key, attempt_number, status) VALUES ('xa1', 'rls-key-b', 2, 'IN_PROGRESS')",
+                "INSERT INTO utda.audit_events (event_id, actor, event_type, project_id) VALUES ('xe1', 'rt', 'E', 'RLS_PROJ_B')",
+                "INSERT INTO utda.audit_events (event_id, actor, event_type, project_id) VALUES ('xe2', 'rt', 'E', NULL)",
+            ]
+            for stmt in cross_inserts:
+                with rconn.cursor() as cur:
+                    cur.execute("SELECT set_config('utda.current_project_id', 'RLS_PROJ_A', true)")
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege, msg=f"RLS allowed cross insert: {stmt}"):
+                        cur.execute(stmt)
+                rconn.rollback()
+
+            # 4 & 11: Runtime under RLS_PROJ_A cannot UPDATE B's rows or reassign A's row to B
+            with rconn.cursor() as cur:
+                cur.execute("SELECT set_config('utda.current_project_id', 'RLS_PROJ_A', true)")
+                cur.execute("UPDATE utda.projects SET project_name = 'Hacked' WHERE project_id = 'RLS_PROJ_B'")
+                self.assertEqual(cur.rowcount, 0)
+                cur.execute("UPDATE utda.idempotency_keys SET status = 'FAILED' WHERE idempotency_key = 'rls-key-b'")
+                self.assertEqual(cur.rowcount, 0)
+                cur.execute("UPDATE utda.processing_attempts SET status = 'FAILED' WHERE attempt_id = 'rls-att-b'")
+                self.assertEqual(cur.rowcount, 0)
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    cur.execute("UPDATE utda.feature_processing_states SET project_id = 'RLS_PROJ_B' WHERE state_id = 'rls-st-a'")
+                rconn.rollback()
+                cur.execute("SELECT set_config('utda.current_project_id', 'RLS_PROJ_A', true)")
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    cur.execute("UPDATE utda.processing_attempts SET idempotency_key = 'rls-key-b' WHERE attempt_id = 'rls-att-a'")
+            rconn.rollback()
+
+            # 5 & 11: Runtime cannot DELETE own or another project's rows
+            for del_stmt in (
+                "DELETE FROM utda.processing_attempts WHERE attempt_id = 'rls-att-a'",
+                "DELETE FROM utda.idempotency_keys WHERE idempotency_key = 'rls-key-a'",
+                "DELETE FROM utda.projects WHERE project_id = 'RLS_PROJ_B'",
+            ):
+                with rconn.cursor() as cur:
+                    cur.execute("SELECT set_config('utda.current_project_id', 'RLS_PROJ_A', true)")
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                        cur.execute(del_stmt)
+                rconn.rollback()
+
+            # 1: Runtime can INSERT & UPDATE own project's permitted rows cleanly
+            with rconn.cursor() as cur:
+                cur.execute("SELECT set_config('utda.current_project_id', 'RLS_PROJ_A', true)")
+                cur.execute(
+                    "UPDATE utda.feature_processing_states SET pr_number = 777 WHERE state_id = 'rls-st-a'"
+                )
+                self.assertEqual(cur.rowcount, 1)
+                cur.execute(
+                    "INSERT INTO utda.audit_events (event_id, actor, event_type, project_id) VALUES ('rls-ev-a-ok', 'rt', 'EVT_OK', 'RLS_PROJ_A')"
+                )
+            rconn.commit()
+
+        # 4. Governance (utda_governance) RLS & aggregation isolation checks (items 8, 9, 10)
+        with psycopg.connect(gov_cfg.dsn, **gov_cfg.connect_kwargs()) as gconn:
+            # Missing context denies all rows and inserts
+            with gconn.cursor() as cur:
+                for tbl in ("approval_records", "rollback_operations", "audit_events", "company_aggregation_runs", "project_master_versions"):
+                    cur.execute(f"SELECT COUNT(*) FROM utda.{tbl}")
+                    self.assertEqual(cur.fetchone()[0], 0)
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    cur.execute(
+                        "INSERT INTO utda.approval_records (approval_id, project_id, document_id, section_id, change_id, approver_identity, approver_role, decision, evidence_reference) VALUES ('gx', 'RLS_PROJ_A', 'D06', 's', 'c', 'u', 'pm', 'approved', 'pr:1')"
+                    )
+            gconn.rollback()
+
+            # Under RLS_PROJ_A only: sees A approvals/rollbacks/audits, not B, not COMPANY_AGGREGATION
+            with gconn.cursor() as cur:
+                cur.execute("SELECT set_config('utda.current_project_id', 'RLS_PROJ_A', true)")
+                cur.execute("SELECT approval_id FROM utda.approval_records")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-app-a"])
+                cur.execute("SELECT rollback_id FROM utda.rollback_operations")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-rb-a"])
+                cur.execute("SELECT COUNT(*) FROM utda.company_aggregation_runs")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute(
+                    "INSERT INTO utda.approval_records (approval_id, project_id, document_id, section_id, change_id, approver_identity, approver_role, decision, evidence_reference) VALUES ('rls-app-a2', 'RLS_PROJ_A', 'D06', 's', 'c2', 'pm@unai.tech', 'pm_or_po', 'approved', 'pr:9')"
+                )
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    cur.execute(
+                        "INSERT INTO utda.approval_records (approval_id, project_id, document_id, section_id, change_id, approver_identity, approver_role, decision, evidence_reference) VALUES ('rls-app-b2', 'RLS_PROJ_B', 'D06', 's', 'c2', 'pm@unai.tech', 'pm_or_po', 'approved', 'pr:9')"
+                    )
+            gconn.rollback()
+
+            # Under COMPANY_AGGREGATION scope: reads eligible MASTER versions, company_aggregation_runs, COMPANY_MASTER drive mapping & revisions
+            with gconn.cursor() as cur:
+                cur.execute("SELECT set_config('utda.governance_scope', 'COMPANY_AGGREGATION', true)")
+                cur.execute("SELECT aggregation_id FROM utda.company_aggregation_runs")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-agg-1"])
+                cur.execute("SELECT master_version_id FROM utda.project_master_versions ORDER BY master_version_id")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-mv-a", "rls-mv-b-ok"])
+                cur.execute("SELECT mapping_id FROM utda.drive_file_mappings")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-dm-comp"])
+                cur.execute("SELECT sync_id FROM utda.drive_sync_revisions")
+                self.assertEqual([r[0] for r in cur.fetchall()], ["rls-ds-comp"])
+                # Even under COMPANY_AGGREGATION, non-COMPANY_MASTER NULL rollback insert is rejected
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    cur.execute(
+                        "INSERT INTO utda.rollback_operations (rollback_id, project_id, document_id, target_scope, restored_from_ref, restored_sha256, operator_identity, status) VALUES ('rb-null-bad', NULL, 'D06', 'DRIVE', 'ref', 'sha', 'adm', 'DONE')"
+                    )
+            gconn.rollback()
+
+        # 5. Table owner (utda_migrator) operates independently of project GUC & supports backup/cascade cleanup (items 11 & 12)
+        with psycopg.connect(migrator_cfg.dsn, **migrator_cfg.connect_kwargs(for_migration=True)) as mconn:
+            with mconn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM utda.projects WHERE project_id IN ('RLS_PROJ_A', 'RLS_PROJ_B')")
+                self.assertEqual(cur.fetchone()[0], 2)
+                # Parent delete by table owner cascades to child processing_attempts cleanly
+                cur.execute("DELETE FROM utda.idempotency_keys WHERE idempotency_key IN ('rls-key-a', 'rls-key-b')")
+                cur.execute("SELECT COUNT(*) FROM utda.processing_attempts WHERE attempt_id IN ('rls-att-a', 'rls-att-b')")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("DELETE FROM utda.drive_file_mappings WHERE mapping_id IN ('rls-dm-a', 'rls-dm-b', 'rls-dm-comp')")
+                cur.execute("DELETE FROM utda.rollback_operations WHERE rollback_id IN ('rls-rb-a', 'rls-rb-b', 'rls-rb-comp')")
+                cur.execute("DELETE FROM utda.github_event_receipts WHERE receipt_id IN ('rls-rec-a', 'rls-rec-b', 'rls-rec-null')")
+                cur.execute("DELETE FROM utda.audit_events WHERE event_id IN ('rls-ev-a', 'rls-ev-b', 'rls-ev-null', 'rls-ev-a-ok')")
+                cur.execute("DELETE FROM utda.projects WHERE project_id IN ('RLS_PROJ_A', 'RLS_PROJ_B')")
+            mconn.commit()
 
     @unittest.skipUnless(
         os.getenv("UTDA_RUN_LIVE_SUPABASE_TESTS") == "true" and os.getenv("UTDA_DATABASE_URL"),

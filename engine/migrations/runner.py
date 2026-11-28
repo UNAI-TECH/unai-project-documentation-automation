@@ -100,7 +100,7 @@ def _rewrite_schema_prefix(sql: str, schema: str) -> str:
     if safe_schema == "utda":
         return sql
     quoted = quote_ident(safe_schema, kind="schema")
-    rewritten = re.sub(r"\butda\.", f"{quoted}.", sql)
+    rewritten = re.sub(r"(?<!')\butda\.", f"{quoted}.", sql)
     rewritten = re.sub(
         r"\bSCHEMA\s+(IF\s+NOT\s+EXISTS\s+)?utda\b",
         lambda m: f"SCHEMA {m.group(1) or ''}{quoted}",
