@@ -740,6 +740,7 @@ class UTDADatabaseRepository:
         idempotency_key: str,
         attempt_id: str,
         attempt_number: int | None = None,
+        expected_fence_version: int | None = None,
         attempt_status: str,
         final_key_status: str,
         retry_state: str = "NONE",
@@ -778,7 +779,6 @@ class UTDADatabaseRepository:
             UPDATE {keys_tbl}
             SET status = %s,
                 active_attempt_id = NULL,
-                attempt_fence_version = attempt_fence_version + 1,
                 completed_at = NOW(),
                 result_summary = %s::jsonb
             WHERE idempotency_key = %s
@@ -798,7 +798,7 @@ class UTDADatabaseRepository:
                         f"Idempotency key '{sanitize_log_text(idempotency_key)}' was not found."
                     )
 
-                key_status, active_attempt_id, _fence_ver, is_expired = key_row
+                key_status, active_attempt_id, row_fence_ver, is_expired = key_row
                 if key_status != "IN_PROGRESS":
                     raise StaleAttemptError(
                         f"Cannot finalize attempt '{attempt_id}': key status is '{key_status}', expected 'IN_PROGRESS'."
@@ -806,6 +806,10 @@ class UTDADatabaseRepository:
                 if active_attempt_id != attempt_id:
                     raise StaleAttemptError(
                         f"Stale attempt '{attempt_id}' rejected; active attempt is '{active_attempt_id}'."
+                    )
+                if expected_fence_version is not None and int(row_fence_ver or 0) != int(expected_fence_version):
+                    raise StaleAttemptError(
+                        f"Fence version mismatch for '{attempt_id}': expected {expected_fence_version}, found {row_fence_ver}."
                     )
                 if is_expired:
                     raise StaleAttemptError(
@@ -888,6 +892,94 @@ class UTDADatabaseRepository:
             raise StaleAttemptError(
                 f"Stale attempt '{attempt_id}' rejected after ambiguous commit reconciliation."
             )
+
+    def renew_attempt_lease(
+        self,
+        *,
+        idempotency_key: str,
+        attempt_id: str,
+        expected_fence_version: int,
+        extend_ttl_seconds: int = 900,
+    ) -> dict[str, Any]:
+        """Atomically extend lease expiry when active_attempt_id and attempt_fence_version match."""
+        if not attempt_id or not str(attempt_id).strip():
+            raise StaleAttemptError("attempt_id is required to renew a processing lease.")
+        if extend_ttl_seconds <= 0:
+            raise ValueError("extend_ttl_seconds must be positive.")
+
+        keys_tbl = self._tbl("idempotency_keys")
+        attempts_tbl = self._tbl("processing_attempts")
+        lock_key_sql = f"""
+            SELECT status, active_attempt_id, attempt_fence_version,
+                   (expires_at IS NOT NULL AND expires_at < NOW()) AS is_expired
+            FROM {keys_tbl}
+            WHERE idempotency_key = %s
+            FOR UPDATE
+        """
+        renew_sql = f"""
+            UPDATE {keys_tbl}
+            SET expires_at = NOW() + (%s::integer * INTERVAL '1 second')
+            WHERE idempotency_key = %s
+              AND status = 'IN_PROGRESS'
+              AND active_attempt_id = %s
+              AND attempt_fence_version = %s
+            RETURNING expires_at, attempt_fence_version
+        """
+
+        def _op(conn: Any) -> dict[str, Any]:
+            with conn.cursor() as cur:
+                cur.execute(lock_key_sql, (idempotency_key,))
+                key_row = cur.fetchone()
+                if key_row is None:
+                    raise StaleAttemptError(
+                        f"Idempotency key '{sanitize_log_text(idempotency_key)}' was not found."
+                    )
+                key_status, active_attempt_id, row_fence_ver, is_expired = key_row
+                if key_status != "IN_PROGRESS":
+                    raise StaleAttemptError(
+                        f"Cannot renew lease for '{attempt_id}': key status is '{key_status}'."
+                    )
+                if active_attempt_id != attempt_id:
+                    raise StaleAttemptError(
+                        f"Stale worker '{attempt_id}' cannot renew; active attempt is '{active_attempt_id}'."
+                    )
+                if int(row_fence_ver or 0) != int(expected_fence_version):
+                    raise StaleAttemptError(
+                        f"Stale fence version {expected_fence_version} cannot renew; current version is {row_fence_ver}."
+                    )
+                if is_expired:
+                    raise StaleAttemptError(
+                        f"Cannot renew expired lease for attempt '{attempt_id}'."
+                    )
+
+                cur.execute(
+                    f"SELECT status FROM {attempts_tbl} WHERE attempt_id = %s AND idempotency_key = %s FOR UPDATE",
+                    (attempt_id, idempotency_key),
+                )
+                att_row = cur.fetchone()
+                if att_row is None or att_row[0] != "IN_PROGRESS":
+                    raise StaleAttemptError(
+                        f"Cannot renew lease: attempt '{attempt_id}' is not IN_PROGRESS."
+                    )
+
+                cur.execute(
+                    renew_sql,
+                    (extend_ttl_seconds, idempotency_key, attempt_id, expected_fence_version),
+                )
+                upd = cur.fetchone()
+                if upd is None:
+                    raise StaleAttemptError(
+                        f"Lease renewal rejected for attempt '{attempt_id}'."
+                    )
+                return {
+                    "renewed": True,
+                    "idempotency_key": idempotency_key,
+                    "attempt_id": attempt_id,
+                    "fence_version": int(upd[1]),
+                    "expires_at": upd[0].isoformat() if hasattr(upd[0], "isoformat") else str(upd[0]),
+                }
+
+        return self.db.run_in_transaction(_op)
 
     def acquire_idempotency_key(
         self,

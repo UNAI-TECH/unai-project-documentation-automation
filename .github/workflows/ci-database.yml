@@ -28,8 +28,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install PostgreSQL client and Python dependencies
@@ -136,7 +136,7 @@ jobs:
         run: python -m engine.db_health --readonly-verify --json
       - name: Upload CI test output artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: utda-pg16-security-ci-${{ github.run_id }}
           path: artifacts/

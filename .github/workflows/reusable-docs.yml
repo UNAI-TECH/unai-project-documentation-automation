@@ -43,25 +43,25 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout target application repository (Repo C)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: workspace/repo
           fetch-depth: 0
       - name: Checkout central automation engine (Repo B)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: UNAI-TECH/unai-project-documentation-automation
           ref: ${{ inputs.utda_ref }}
           path: workspace/utda
           token: ${{ secrets.UTDA_APP_TOKEN || secrets.GITHUB_TOKEN }}
       - name: Checkout central master templates (Repo A)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: UNAI-TECH/unai-project-documentation
           ref: ${{ inputs.templates_ref }}
           path: workspace/templates
           token: ${{ secrets.UTDA_APP_TOKEN || secrets.GITHUB_TOKEN }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install engine dependencies
@@ -93,7 +93,7 @@ jobs:
         run: python -m engine.trigger
       - name: Upload run artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: utda-run-${{ inputs.project_id }}-${{ github.run_id }}
           path: workspace/utda/artifacts/

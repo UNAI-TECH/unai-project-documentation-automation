@@ -294,7 +294,7 @@ class _FakeCursor:
                         )
                     ]
             return
-        if "UPDATE" in norm and ".processing_attempts" in norm and "LOCK_EXPIRED" in norm:
+        if norm.startswith("UPDATE") and ".processing_attempts" in norm and "LOCK_EXPIRED" in norm:
             idem_key = params[0]
             with state.lock:
                 self.conn.undo_ops.append(("attempts_snapshot", copy.deepcopy(state.attempts)))
@@ -330,7 +330,7 @@ class _FakeCursor:
                 )
                 self._rows = [(attempt_id, next_num)]
             return
-        if "UPDATE" in norm and ".processing_attempts" in norm:
+        if norm.startswith("UPDATE") and ".processing_attempts" in norm:
             attempt_status, retry_state, error_code, error_summary, attempt_id, idem_key = params
             with state.lock:
                 self.conn.undo_ops.append(("attempts_snapshot", copy.deepcopy(state.attempts)))
@@ -371,6 +371,39 @@ class _FakeCursor:
                         )
                     ]
             return
+        if "SELECT status, status" in norm:  # pragma: no cover
+            return
+        if "SELECT status FROM" in norm and ".processing_attempts" in norm and "WHERE attempt_id = %s" in norm:
+            attempt_id, idem_key = params
+            with state.lock:
+                att = next(
+                    (a for a in state.attempts if a["attempt_id"] == attempt_id and a["idempotency_key"] == idem_key),
+                    None,
+                )
+                if att:
+                    self._rows = [(att["status"],)]
+            return
+        if "SET expires_at = NOW()" in norm and ".idempotency_keys" in norm and "attempt_fence_version = %s" in norm:
+            from datetime import datetime, timedelta, timezone
+
+            ttl, idem_key, active_attempt_id, expected_ver = params
+            with state.lock:
+                rec = state.idempotency_keys.get(idem_key)
+                if (
+                    rec
+                    and rec.get("status") == "IN_PROGRESS"
+                    and rec.get("active_attempt_id") == active_attempt_id
+                    and int(rec.get("attempt_fence_version", 0)) == int(expected_ver)
+                    and not rec.get("expired")
+                ):
+                    self.conn.undo_ops.append(("idem_key", idem_key, copy.deepcopy(rec)))
+                    new_exp = datetime.now(timezone.utc) + timedelta(seconds=int(ttl))
+                    rec["expired"] = False
+                    rec["expires_at"] = new_exp
+                    self._rows = [(new_exp, int(rec["attempt_fence_version"]))]
+                else:
+                    self._rows = []
+            return
         if "UPDATE" in norm and ".idempotency_keys" in norm and "active_attempt_id = NULL" in norm:
             import json as _json
 
@@ -381,7 +414,6 @@ class _FakeCursor:
                     self.conn.undo_ops.append(("idem_key", idem_key, copy.deepcopy(rec)))
                     rec["status"] = status
                     rec["active_attempt_id"] = None
-                    rec["attempt_fence_version"] = int(rec.get("attempt_fence_version", 0)) + 1
                     rec["expired"] = False
                     rec["result_summary"] = _json.loads(summary_json)
                     self._rows = [(idem_key,)]
@@ -1082,7 +1114,9 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             att1_id = winners[0]["attempt_id"]
             self.assertTrue(att1_id)
             self.assertEqual(winners[0]["attempt_number"], 1)
+            self.assertEqual(winners[0]["fence_version"], 1)
             self.assertEqual(state.idempotency_keys[idem]["active_attempt_id"], att1_id)
+            self.assertEqual(state.idempotency_keys[idem]["attempt_fence_version"], 1)
             self.assertEqual(len(state.attempts), 1)
             self.assertEqual(state.attempts[0]["status"], "IN_PROGRESS")
 
@@ -1116,12 +1150,14 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             att2_id = rec_winners[0]["attempt_id"]
             self.assertNotEqual(att2_id, att1_id)
             self.assertEqual(rec_winners[0]["attempt_number"], 2)
+            self.assertEqual(rec_winners[0]["fence_version"], 2)
             self.assertEqual(state.attempts[0]["status"], "FAILED")
             self.assertEqual(state.attempts[0]["retry_state"], "LOCK_EXPIRED")
             self.assertEqual([a["attempt_number"] for a in state.attempts], [1, 2])
             self.assertEqual(state.idempotency_keys[idem]["active_attempt_id"], att2_id)
+            self.assertEqual(state.idempotency_keys[idem]["attempt_fence_version"], 2)
 
-            # Stale worker 1 is rejected without altering attempt 2 or idempotency key state
+            # Stale worker 1 is rejected on finalize AND renew without altering attempt 2 or fence version
             with self.assertRaises(StaleAttemptError):
                 repo.finalize_processing_attempt(
                     event_receipt_id=None,
@@ -1132,9 +1168,30 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
                     final_key_status="COMPLETED",
                     result_summary={"stale": True},
                 )
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    idempotency_key=idem,
+                    attempt_id=att1_id,
+                    expected_fence_version=1,
+                )
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    idempotency_key=idem,
+                    attempt_id=att2_id,
+                    expected_fence_version=1,
+                )
+            renewed = repo.renew_attempt_lease(
+                idempotency_key=idem,
+                attempt_id=att2_id,
+                expected_fence_version=2,
+                extend_ttl_seconds=1200,
+            )
+            self.assertTrue(renewed["renewed"])
+            self.assertEqual(renewed["fence_version"], 2)
             self.assertEqual(state.attempts[1]["status"], "IN_PROGRESS")
             self.assertEqual(state.idempotency_keys[idem]["status"], "IN_PROGRESS")
             self.assertEqual(state.idempotency_keys[idem]["active_attempt_id"], att2_id)
+            self.assertEqual(state.idempotency_keys[idem]["attempt_fence_version"], 2)
 
             # Deprecated legacy methods cannot bypass fencing without matching active attempt_id
             with warnings.catch_warnings(record=True) as caught:
@@ -1183,6 +1240,7 @@ class Phase1DatabaseLifecycleAndPersistenceTests(unittest.TestCase):
             self.assertEqual(state.attempts[1]["status"], "SUCCEEDED")
             self.assertEqual(state.idempotency_keys[idem]["status"], "COMPLETED")
             self.assertIsNone(state.idempotency_keys[idem]["active_attempt_id"])
+            self.assertEqual(state.idempotency_keys[idem]["attempt_fence_version"], 2)
             self.assertNotIn("raw-secret-api-key", repr(state.idempotency_keys[idem]["result_summary"]))
 
             # Duplicate finalization even with att2_id is rejected once completed
@@ -1441,6 +1499,143 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             with chk.cursor() as cur:
                 cur.execute("SELECT to_regclass('utda.should_not_exist')")
                 self.assertIsNone(cur.fetchone()[0])
+
+                # Migration 0003 schema & constraint checks on PG16: BIGINT, CHECK (>=0), deferred FK
+                cur.execute(
+                    """
+                    SELECT data_type
+                    FROM information_schema.columns
+                    WHERE table_schema = 'utda'
+                      AND table_name = 'idempotency_keys'
+                      AND column_name = 'attempt_fence_version'
+                    """
+                )
+                self.assertEqual(cur.fetchone()[0], "bigint")
+
+                cur.execute(
+                    """
+                    SELECT indexname
+                    FROM pg_indexes
+                    WHERE schemaname = 'utda'
+                      AND tablename = 'processing_attempts'
+                      AND indexname = 'uq_processing_attempts_key_attempt'
+                    """
+                )
+                self.assertEqual(cur.fetchone()[0], "uq_processing_attempts_key_attempt")
+
+        # Verify chk_idempotency_fence_nonnegative and DEFERRABLE fk_idempotency_active_attempt
+        with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as fchk:
+            with fchk.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO utda.projects (
+                        project_id, project_name, status, github_owner, github_repo, default_branch
+                    )
+                    VALUES ('MIG0003_CHK', 'Mig 0003 Check', 'active', 'UNAI-TECH', 'mig0003', 'main')
+                    ON CONFLICT (project_id) DO NOTHING
+                    """
+                )
+            fchk.commit()
+            with self.assertRaises(psycopg.errors.CheckViolation):
+                with fchk.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO utda.idempotency_keys (
+                            idempotency_key, scope, project_id, feature_id, report_blob_sha,
+                            target_document_id, status, attempt_fence_version
+                        )
+                        VALUES ('neg-fence-test', 's', 'MIG0003_CHK', 'F1', 'sha', 'D06', 'FAILED', -1)
+                        """
+                    )
+            fchk.rollback()
+
+            # Deferred FK allows updating active_attempt_id before child insert within same tx,
+            # but rejects commit if child attempt_id is missing.
+            with self.assertRaises(psycopg.errors.ForeignKeyViolation):
+                with fchk.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO utda.idempotency_keys (
+                            idempotency_key, scope, project_id, feature_id, report_blob_sha,
+                            target_document_id, status, active_attempt_id, attempt_fence_version
+                        )
+                        VALUES ('bogus-fk-test', 's', 'MIG0003_CHK', 'F1', 'sha', 'D06', 'IN_PROGRESS', 'missing-att-id', 1)
+                        """
+                    )
+                fchk.commit()
+            fchk.rollback()
+
+        # Upgrade test: apply 0001 + 0002 with pre-existing rows, then upgrade to 0003
+        upg_cfg = DatabaseConfig(
+            dsn=cfg.dsn,
+            migration_dsn=cfg.migration_dsn,
+            schema="utda_upgrade_0003_test",
+            pool_mode=cfg.pool_mode,
+            migration_pool_mode=cfg.migration_pool_mode,
+            sslmode=cfg.sslmode,
+            migration_sslmode=cfg.migration_sslmode,
+        )
+        with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+            with adm.cursor() as cur:
+                cur.execute("CREATE SCHEMA IF NOT EXISTS utda_upgrade_0003_test AUTHORIZATION utda_migrator")
+            adm.commit()
+        try:
+            with tempfile.TemporaryDirectory() as utmp:
+                udir = Path(utmp)
+                for fname in ("0001_initial_utda_schema.sql", "0002_roles_and_indexes.sql"):
+                    (udir / fname).write_text(
+                        (MIGRATIONS_DIR / fname).read_text(encoding="utf-8"),
+                        encoding="utf-8",
+                    )
+                res_pre = apply_migrations(upg_cfg, udir, dry_run=False)
+                self.assertEqual(res_pre["applied"], ["0001_initial_utda_schema", "0002_roles_and_indexes"])
+
+                # Seed pre-0003 rows (project, COMPLETED idempotency_key, historical attempt)
+                with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+                    with adm.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO utda_upgrade_0003_test.projects (
+                                project_id, project_name, status, github_owner, github_repo, default_branch
+                            ) VALUES ('PRE0003', 'Pre', 'active', 'UNAI-TECH', 'pre', 'main')
+                            """
+                        )
+                        cur.execute(
+                            """
+                            INSERT INTO utda_upgrade_0003_test.idempotency_keys (
+                                idempotency_key, scope, project_id, feature_id, report_blob_sha, target_document_id, status
+                            ) VALUES ('pre-key-1', 'phase1', 'PRE0003', 'F1', 'blob1', 'D06', 'COMPLETED')
+                            """
+                        )
+                        cur.execute(
+                            """
+                            INSERT INTO utda_upgrade_0003_test.processing_attempts (
+                                attempt_id, idempotency_key, attempt_number, status
+                            ) VALUES ('pre-att-1', 'pre-key-1', 1, 'SUCCEEDED')
+                            """
+                        )
+                    adm.commit()
+
+                # Add 0003 and verify upgrade + pre-existing row defaults + repeat-run idempotency
+                (udir / "0003_idempotency_fencing.sql").write_text(
+                    (MIGRATIONS_DIR / "0003_idempotency_fencing.sql").read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                res_upg = apply_migrations(upg_cfg, udir, dry_run=False)
+                self.assertEqual(res_upg["applied"], ["0003_idempotency_fencing"])
+                res_upg_again = apply_migrations(upg_cfg, udir, dry_run=False)
+                self.assertEqual(res_upg_again["applied"], [])
+                with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+                    with adm.cursor() as cur:
+                        cur.execute(
+                            "SELECT active_attempt_id, attempt_fence_version FROM utda_upgrade_0003_test.idempotency_keys WHERE idempotency_key = 'pre-key-1'"
+                        )
+                        self.assertEqual(cur.fetchone(), (None, 0))
+        finally:
+            with psycopg.connect(cfg.dsn, **cfg.connect_kwargs()) as adm:
+                with adm.cursor() as cur:
+                    cur.execute("DROP SCHEMA IF EXISTS utda_upgrade_0003_test CASCADE")
+                adm.commit()
 
         with DatabaseManager(cfg) as db:
             health = check_database_health(db, read_only=True)
@@ -1939,6 +2134,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             att1_id = first_winners[0]["attempt_id"]
             self.assertTrue(att1_id)
             self.assertEqual(first_winners[0]["attempt_number"], 1)
+            self.assertEqual(first_winners[0]["fence_version"], 1)
 
             # Immutable identity mismatch rejected on real PG16 across every protected column
             for override in (
@@ -1977,8 +2173,9 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             att2_id = second_winners[0]["attempt_id"]
             self.assertNotEqual(att2_id, att1_id)
             self.assertEqual(second_winners[0]["attempt_number"], 2)
+            self.assertEqual(second_winners[0]["fence_version"], 2)
 
-            # Stale worker 1 finalization rejected without changing attempt 2 or idempotency key
+            # Stale worker 1 cannot finalize OR renew, and cannot alter fence version
             with self.assertRaises(StaleAttemptError):
                 repo.finalize_processing_attempt(
                     event_receipt_id=rec["receipt_id"],
@@ -1989,13 +2186,69 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     final_key_status="COMPLETED",
                     result_summary={"stale": True},
                 )
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    idempotency_key=idem,
+                    attempt_id=att1_id,
+                    expected_fence_version=1,
+                )
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    idempotency_key=idem,
+                    attempt_id=att2_id,
+                    expected_fence_version=1,
+                )
             with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as chk:
                 with chk.cursor() as cur:
                     cur.execute(
-                        "SELECT status, active_attempt_id FROM utda.idempotency_keys WHERE idempotency_key = %s",
+                        "SELECT status, active_attempt_id, attempt_fence_version, expires_at FROM utda.idempotency_keys WHERE idempotency_key = %s",
                         (idem,),
                     )
-                    self.assertEqual(cur.fetchone(), ("IN_PROGRESS", att2_id))
+                    before_status, before_att, before_ver, before_exp = cur.fetchone()
+                    self.assertEqual((before_status, before_att, before_ver), ("IN_PROGRESS", att2_id, 2))
+
+            # Concurrent lease renewal race: valid worker renewals succeed; stale worker renewals fail
+            def _race_renew(worker_idx: int) -> str:
+                if worker_idx % 2 == 0:
+                    res = repo.renew_attempt_lease(
+                        idempotency_key=idem,
+                        attempt_id=att2_id,
+                        expected_fence_version=2,
+                        extend_ttl_seconds=1800,
+                    )
+                    return f"ok:{res['fence_version']}"
+                try:
+                    repo.renew_attempt_lease(
+                        idempotency_key=idem,
+                        attempt_id=att1_id,
+                        expected_fence_version=1,
+                    )
+                    return "unexpected_stale_ok"
+                except StaleAttemptError:
+                    return "rejected_stale"
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                race_outcomes = list(ex.map(_race_renew, range(4)))
+            self.assertEqual(sorted(race_outcomes), ["ok:2", "ok:2", "rejected_stale", "rejected_stale"])
+
+            # Active worker 2 lease renewal with matching attempt_id & fence_version atomically extends expiry
+            ren_ok = repo.renew_attempt_lease(
+                idempotency_key=idem,
+                attempt_id=att2_id,
+                expected_fence_version=2,
+                extend_ttl_seconds=1800,
+            )
+            self.assertTrue(ren_ok["renewed"])
+            self.assertEqual(ren_ok["fence_version"], 2)
+            with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as chk:
+                with chk.cursor() as cur:
+                    cur.execute(
+                        "SELECT expires_at, attempt_fence_version FROM utda.idempotency_keys WHERE idempotency_key = %s",
+                        (idem,),
+                    )
+                    after_exp, after_ver = cur.fetchone()
+                    self.assertGreater(after_exp, before_exp)
+                    self.assertEqual(after_ver, 2)
 
             # Rollback & recovery inside transaction: fault mid-transaction leaves attempt 2 IN_PROGRESS
             with self.assertRaises(RuntimeError):
@@ -2058,7 +2311,7 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
             finally:
                 db._pool.connection = orig_commit_pool_fn  # type: ignore[method-assign]
 
-            # Stale attempt or already-completed attempt cannot finalize again
+            # Stale attempt or already-completed attempt cannot finalize or renew again
             with self.assertRaises(StaleAttemptError):
                 repo.finalize_processing_attempt(
                     event_receipt_id=rec["receipt_id"],
@@ -2068,6 +2321,94 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                     attempt_status="FAILED",
                     final_key_status="FAILED",
                 )
+            with self.assertRaises(StaleAttemptError):
+                repo.renew_attempt_lease(
+                    idempotency_key=idem,
+                    attempt_id=att2_id,
+                    expected_fence_version=2,
+                )
+
+            # Multiple recovery cycles maintain strictly monotonic fence_version progression
+            # and completion preserves the active attempt's version without bump or reset.
+            multi_key = "ci-pg16-multi-fence-1"
+            observed_versions: list[int] = []
+            c1 = repo.claim_idempotency_and_attempt(
+                idempotency_key=multi_key,
+                scope="phase1_correlation",
+                project_id="CI_CONC_TEST",
+                feature_id="FEAT-FENCE",
+                report_blob_sha="blob-f",
+                target_document_id="D06",
+                event_receipt_id=rec["receipt_id"],
+            )
+            observed_versions.append(c1["fence_version"])
+            with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as aconn:
+                with aconn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE utda.idempotency_keys SET expires_at = NOW() - INTERVAL '1 minute' WHERE idempotency_key = %s",
+                        (multi_key,),
+                    )
+                aconn.commit()
+
+            c2 = repo.claim_idempotency_and_attempt(
+                idempotency_key=multi_key,
+                scope="phase1_correlation",
+                project_id="CI_CONC_TEST",
+                feature_id="FEAT-FENCE",
+                report_blob_sha="blob-f",
+                target_document_id="D06",
+                event_receipt_id=rec["receipt_id"],
+            )
+            observed_versions.append(c2["fence_version"])
+            repo.finalize_processing_attempt(
+                event_receipt_id=rec["receipt_id"],
+                idempotency_key=multi_key,
+                attempt_id=c2["attempt_id"],
+                expected_fence_version=2,
+                attempt_status="FAILED",
+                final_key_status="FAILED",
+                error_summary="recoverable failure",
+            )
+
+            c3 = repo.claim_idempotency_and_attempt(
+                idempotency_key=multi_key,
+                scope="phase1_correlation",
+                project_id="CI_CONC_TEST",
+                feature_id="FEAT-FENCE",
+                report_blob_sha="blob-f",
+                target_document_id="D06",
+                event_receipt_id=rec["receipt_id"],
+            )
+            observed_versions.append(c3["fence_version"])
+            with psycopg.connect(admin_cfg.dsn, **admin_cfg.connect_kwargs()) as aconn:
+                with aconn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE utda.idempotency_keys SET expires_at = NOW() - INTERVAL '1 minute' WHERE idempotency_key = %s",
+                        (multi_key,),
+                    )
+                aconn.commit()
+
+            c4 = repo.claim_idempotency_and_attempt(
+                idempotency_key=multi_key,
+                scope="phase1_correlation",
+                project_id="CI_CONC_TEST",
+                feature_id="FEAT-FENCE",
+                report_blob_sha="blob-f",
+                target_document_id="D06",
+                event_receipt_id=rec["receipt_id"],
+            )
+            observed_versions.append(c4["fence_version"])
+            self.assertEqual(observed_versions, [1, 2, 3, 4])
+
+            repo.finalize_processing_attempt(
+                event_receipt_id=rec["receipt_id"],
+                idempotency_key=multi_key,
+                attempt_id=c4["attempt_id"],
+                expected_fence_version=4,
+                attempt_status="SUCCEEDED",
+                final_key_status="COMPLETED",
+                result_summary={"cycle": 4},
+            )
 
         with psycopg.connect(runtime_cfg.dsn, **runtime_cfg.connect_kwargs()) as rconn:
             with rconn.cursor() as cur:
@@ -2099,8 +2440,14 @@ class Phase1LivePostgreSQLTests(unittest.TestCase):
                 kstatus, kactive, kfence, ksummary = cur.fetchone()
                 self.assertEqual(kstatus, "COMPLETED")
                 self.assertIsNone(kactive)
-                self.assertGreaterEqual(kfence, 3)
+                self.assertEqual(kfence, 2)
                 self.assertNotIn("pg16-secret-tok", ksummary)
+
+                cur.execute(
+                    "SELECT status, active_attempt_id, attempt_fence_version FROM utda.idempotency_keys WHERE idempotency_key = %s",
+                    (multi_key,),
+                )
+                self.assertEqual(cur.fetchone(), ("COMPLETED", None, 4))
 
     @unittest.skipUnless(
         os.getenv("UTDA_RUN_LIVE_SUPABASE_TESTS") == "true" and os.getenv("UTDA_DATABASE_URL"),
