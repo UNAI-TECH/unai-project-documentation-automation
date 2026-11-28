@@ -230,7 +230,7 @@ class _FakeCursor:
             idem_key = params[0]
             with state.lock:
                 rec = state.idempotency_keys.get(idem_key)
-                if rec:
+                if rec and (self.conn.current_project_id is None or rec["project_id"] == self.conn.current_project_id):
                     self._rows = [
                         (
                             rec["scope"],

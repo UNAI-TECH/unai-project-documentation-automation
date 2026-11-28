@@ -698,7 +698,12 @@ class UTDADatabaseRepository:
 
                 cur.execute(lock_key_sql, (idempotency_key,))
                 key_row = cur.fetchone()
-                if key_row is None:  # pragma: no cover - defensive guard
+                if key_row is None:
+                    if not inserted_new:
+                        raise IdempotencyIdentityMismatchError(
+                            "Idempotency key identity mismatch for key "
+                            f"'{sanitize_log_text(idempotency_key)}': key conflicts with another project."
+                        )
                     raise RuntimeError(f"Idempotency key '{idempotency_key}' vanished during claim.")
 
                 (
